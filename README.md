@@ -109,6 +109,8 @@ tools/build.sh --thin                   # accepted, same file (old commands keep
 tools/build.sh --full                   # refused: the core is never bundled
 ```
 
+Every rules command honours `PISING_DRY_RUN=1`: it prints `[dry-run] iptables …`
+instead of running it, so a new ROM can be inspected without cutting the network.
 `tools/build.sh` runs `tests/smoke-check.sh` first (every script parses, both
 configs pass `check`, every payload file is present) and then the CLI, action and
 installer tests. It never copies `module/payload/bin/sing-box` into the zip, even
@@ -303,7 +305,7 @@ unchanged.
 | `fwmark` | `0x00200000/0x00200000` | mark set by TPROXY, matched by `ip rule` (outside the `0x0–0x1ffff` range netd uses) |
 | `own_mark` / `routing_mark` | `0x00400000` / `4194304` | optional second loop guard (`outbound.routing_mark`) |
 | `table` / `pref` | `2027` / `110` | routing table and `ip rule` preference, both free on this phone |
-| `ipv6` | `block` | `proxy` = proxy IPv6 too; `block` = reject IPv6 (no leak); `off` = leave it alone (leaks). `true`/`false` are aliases of `proxy`/`block` |
+| `ipv6` | `block` | `proxy` = proxy IPv6 too; `block` = reject IPv6 (no leak, link-local DNS still passes); `disable` = switch the IPv6 stack off (`disable_ipv6=1`, restored on stop) so netd has no IPv6 resolver to leak through; `off` = leave it alone (leaks). `true`/`false` are aliases of `proxy`/`block`, `-1`/`none` of `disable` |
 | `quic` | `disable` | reject UDP 443/80 so apps fall back to TCP |
 | `proxy_mode` | `blacklist` | `blacklist` = proxy everything except listed apps; `whitelist` = only listed apps |
 | `bypass_interfaces` | `ds-br+ ds-v+ vgate0 dummy0` | incoming interfaces that are never touched (Droidspaces bridges, VM gateway) |
@@ -340,7 +342,11 @@ of an already handled connection. `PISING_GUARD` (filter OUTPUT) rejects direct
 connections to the tproxy port and, with `quic=disable`, UDP 443/80.
 `PISING_V6BLOCK` (filter OUTPUT/FORWARD, `ipv6=block`) rejects IPv6 except
 link-local/multicast, and rejects **global** IPv6 DNS. Link-local DNS is let
-through on purpose: see the DNS note in the trap list.
+through on purpose: see the DNS note in the trap list. `ipv6=disable` installs no
+IPv6 chain at all: it writes `disable_ipv6=1` (plus `accept_ra=0`, `autoconf=0`)
+to every `/proc/sys/net/ipv6/conf/*` except `lo`, and `off`/`stop` puts the saved
+values back. Caveat: IMS (VoLTE/VoWiFi) talks IPv6 over `rmnet` on some carriers,
+so if calls stop working use `block` plus Android Private DNS (DoT) instead.
 
 Routing: `ip rule add fwmark <fwmark> table 2027 pref 110` plus
 `ip route add local default dev lo table 2027` (the same for `ip -6` in

@@ -58,7 +58,9 @@ tools/fetch-sing-box.sh       pinned release + sha256
 tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip (module only,
                               the core is never bundled; --full is refused)
 tests/smoke-check.sh          sh -n on every script + sing-box check on both configs
-tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (14 assertions)
+tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (18 assertions:
+                              TPROXY/DNS/per-app, PISING_DRY_RUN prints without
+                              installing, ipv6=disable sets and restores sysctls)
 tests/cli-test.sh             host, stub core: dashboard resolution (relative /
                               object / absolute), core_log_level, 🟢/🔴 description,
                               log split/rotation, watchdog vs a user stop, a decoy
@@ -159,6 +161,12 @@ Why it must stay this way (each measured — see README):
   down), while the hijacked IPv4 DNS answered a root shell in 25-270 ms. Letting
   link-local DNS out fixed it (5/8 immediately, healing after). Cost: names go to
   the LAN router (a DNS leak). Global IPv6 DNS is still rejected.
+- `ipv6=disable` is the leak-free version of the above and needs no reject: it
+  writes `disable_ipv6=1` (+ `accept_ra=0`, `autoconf=0`) to every
+  `/proc/sys/net/ipv6/conf/*` except `lo`, so netd has no IPv6 resolver at all.
+  The previous values are saved in `run/v6.stack.saved` and restored by
+  `off`/`stop` — a module that leaves the stack off after a stop would break the
+  phone on its own. `tests/netns-tproxy-test.sh` asserts both directions.
 - `-D` needs the full match spec (`-m socket --transparent`), or `PISING_DIVERT`
   survives `stop`.
 

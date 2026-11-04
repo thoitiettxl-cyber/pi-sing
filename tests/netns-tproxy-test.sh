@@ -147,6 +147,27 @@ ns iptables -t mangle -S PISING_LOCAL | grep -q -- '0.0.0.0/0.*MARK or 0x200000'
 sed -i 's/^proxy_mode=.*/proxy_mode="blacklist"/' "$DATA/settings.ini"
 ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
 
+echo "== dry run prints the commands and touches nothing"
+_dry_before="$(ns iptables -t mangle -S 2>/dev/null | md5sum)"
+ns env PISING_DIR="$DATA" PISING_DRY_RUN=1 "$DATA/bin/pi.iptables" on >"${TMP}/dry.out" 2>&1
+grep -q '\[dry-run\] iptables.*TPROXY' "${TMP}/dry.out" &&
+    ok "PISING_DRY_RUN prints the TPROXY command it would run" || bad "dry run printed no TPROXY command"
+[ "$_dry_before" = "$(ns iptables -t mangle -S 2>/dev/null | md5sum)" ] &&
+    ok "a dry run left every rule and hook untouched" || bad "a dry run changed the rule set"
+
+echo "== ipv6=disable turns the stack off and puts it back"
+sed -i 's/^ipv6=.*/ipv6="disable"/' "$DATA/settings.ini"
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+[ "$(ns cat /proc/sys/net/ipv6/conf/vns0/disable_ipv6 2>/dev/null)" = "1" ] &&
+    ok "IPv6 stack disabled on the interface inside the namespace" || bad "disable_ipv6 was not set"
+[ "$(ns cat /proc/sys/net/ipv6/conf/lo/disable_ipv6 2>/dev/null)" = "0" ] &&
+    ok "lo is left alone, ::1 keeps working" || bad "lo lost IPv6 too"
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" off >/dev/null 2>&1
+[ "$(ns cat /proc/sys/net/ipv6/conf/vns0/disable_ipv6 2>/dev/null)" = "0" ] &&
+    ok "\`off\` restored the previous sysctl values" || bad "disable_ipv6 was not restored"
+sed -i 's/^ipv6=.*/ipv6="block"/' "$DATA/settings.ini"
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+
 echo "== counters"
 ns iptables -t mangle -L PISING_LOCAL -n -v 2>/dev/null | head -n 10 | sed 's/^/  /'
 

@@ -20,7 +20,11 @@
 #    mangle OUTPUT returns on that gid; SO_MARK (own_mark) is a second guard.
 #  * ipv6=proxy installs the same rule set with ip6tables (+ `ip -6 rule/route`),
 #    ipv6=block leaves IPv6 unproxied but rejects it, so it cannot leak,
-#    ipv6=off does nothing (IPv6 goes direct: a leak).
+#    ipv6=disable switches the IPv6 stack off (sysctl), so netd has no IPv6
+#    resolver left to leak through, ipv6=off does nothing (IPv6 goes direct).
+#
+# PISING_DRY_RUN=1 prints every command instead of running it: the only way to
+# see what a ROM with unusual chains would get without breaking the network.
 set -u
 
 PISING_DIR="${PISING_DIR:-/data/adb/pi-sing}"
@@ -58,8 +62,33 @@ if iptables -w 100 -t mangle -S >/dev/null 2>&1; then
     IPT_WAIT="-w 100"
 fi
 
-i4() { iptables $IPT_WAIT "$@"; }
-i6() { ip6tables $IPT_WAIT "$@"; }
+# PISING_DRY_RUN=1: print the command line, do not run it, report "not done"
+# so callers that loop until success (rule delete, sysctl) stop after one line.
+DRY_RUN="${PISING_DRY_RUN:-0}"
+dry() {
+    [ "$DRY_RUN" = "1" ] || return 1
+    printf '[dry-run] %s\n' "$*" >&2
+    return 0
+}
+
+i4() { dry iptables $IPT_WAIT "$@" && return 0; iptables $IPT_WAIT "$@"; }
+i6() { dry ip6tables $IPT_WAIT "$@" && return 0; ip6tables $IPT_WAIT "$@"; }
+
+# Write-side `ip` wrapper; read-side calls (`ip rule show`) stay real.
+ipw() {  # $1 = 4|6, rest = ip arguments
+    _pfam="$1"; shift
+    if [ "$DRY_RUN" = "1" ]; then
+        if [ "$_pfam" = 6 ]; then dry ip -6 "$@"; else dry ip "$@"; fi
+        return 1
+    fi
+    if [ "$_pfam" = 6 ]; then ip -6 "$@"; else ip "$@"; fi
+}
+
+# $1 = /proc/sys path, $2 = value
+sysctl_write() {
+    dry "echo $2 > $1" && return 0
+    printf '%s\n' "$2" > "$1" 2>/dev/null
+}
 
 c_ext="PISING_EXT"      # PREROUTING, capture
 c_local="PISING_LOCAL"  # OUTPUT, mark
@@ -141,6 +170,7 @@ read_ap_list() {
 # Delete every occurrence of a rule (max 5) so `on` is idempotent.
 del_all() {
     _ipt="$1"; shift
+    dry "$_ipt" $IPT_WAIT "$@" && return 0
     _n=0
     while [ "$_n" -lt 5 ] && $_ipt "$@" >/dev/null 2>&1; do
         _n=$((_n + 1))
@@ -259,11 +289,8 @@ build_guard() {
 apply_proto() {
     _ipt="$1"            # i4 | i6
     _fam="$2"            # 4 | 6
-    _ipcmd="ip"
-    [ "$_fam" = 6 ] && _ipcmd="ip -6"
-
-    $_ipcmd rule add fwmark "$fwmark" table "$table" pref "$pref" 2>/dev/null
-    $_ipcmd route replace local default dev lo table "$table" 2>/dev/null ||
+    ipw "$_fam" rule add fwmark "$fwmark" table "$table" pref "$pref" 2>/dev/null
+    ipw "$_fam" route replace local default dev lo table "$table" 2>/dev/null ||
         log Error "cannot add local default route to table ${table}"
 
     for _c in "$c_ext" "$c_local" "$c_divert" "$c_bypass" "$c_skip"; do
@@ -326,8 +353,6 @@ apply_v6_block() {
 teardown_proto() {
     _ipt="$1"
     _fam="$2"
-    _ipcmd="ip"
-    [ "$_fam" = 6 ] && _ipcmd="ip -6"
 
     del_all "$_ipt" -t mangle -D PREROUTING -j "$c_ext"
     # the match spec must be identical to the inserted rule or -D does not match
@@ -347,10 +372,10 @@ teardown_proto() {
     done
 
     _n=0
-    while [ "$_n" -lt 5 ] && $_ipcmd rule del fwmark "$fwmark" table "$table" pref "$pref" 2>/dev/null; do
+    while [ "$_n" -lt 5 ] && ipw "$_fam" rule del fwmark "$fwmark" table "$table" pref "$pref" 2>/dev/null; do
         _n=$((_n + 1))
     done
-    $_ipcmd route flush table "$table" 2>/dev/null
+    ipw "$_fam" route flush table "$table" 2>/dev/null
     return 0
 }
 
@@ -358,10 +383,59 @@ teardown_proto() {
 
 ipv6_mode() {
     case "${ipv6:-off}" in
-        true|1|proxy) echo proxy ;;
-        false|0|block) echo block ;;
+        true|1|proxy)     echo proxy ;;
+        false|0|block)    echo block ;;
+        disable|-1|none)  echo disable ;;
         *) echo off ;;
     esac
+}
+
+# ipv6=disable: take the IPv6 stack away instead of rejecting packets.
+# Rejecting IPv6 DNS leaves netd retrying a resolver it cannot reach (measured:
+# 19 errors and 5 timeouts on fe80::1%wlan0) and, once its IPv4 resolvers are
+# marked BROKEN (1800 s), with no working resolver at all: every uncached name
+# failed. Removing the stack means netd has no IPv6 resolver to fall back to, so
+# the IPv4 DNS hijack is the only path left, with nothing to leak through.
+# The previous sysctl values are saved so `off` can put them back.
+v6_stack_saved="${run_dir}/v6.stack.saved"
+
+apply_v6_disable() {
+    : > "$v6_stack_saved" 2>/dev/null
+    _n=0
+    for _d in /proc/sys/net/ipv6/conf/*; do
+        _if="${_d##*/}"
+        # `all` and `default` are templates: writing them cascades to every
+        # interface, lo included, which kills ::1 (measured: lo/disable_ipv6
+        # became 1 even though lo was skipped). Only real interfaces are touched.
+        case "$_if" in all|default|lo) continue ;; esac
+        [ -f "${_d}/disable_ipv6" ] || continue
+        printf '%s %s %s %s\n' "$_if" \
+            "$(cat "${_d}/disable_ipv6" 2>/dev/null)" \
+            "$(cat "${_d}/accept_ra" 2>/dev/null)" \
+            "$(cat "${_d}/autoconf" 2>/dev/null)" >> "$v6_stack_saved"
+        sysctl_write "${_d}/disable_ipv6" 1
+        sysctl_write "${_d}/accept_ra" 0
+        sysctl_write "${_d}/autoconf" 0
+        _n=$((_n + 1))
+    done
+    [ "$_n" -gt 0 ] || { log Warn "ipv6=disable: no /proc/sys/net/ipv6/conf entry to write"; return 0; }
+    log Info "ipv6=disable: IPv6 stack off on ${_n} interface(s), lo kept"
+    return 0
+}
+
+restore_v6_stack() {
+    [ -f "$v6_stack_saved" ] || return 0
+    while read -r _if _dis _ra _ac; do
+        [ -n "${_if:-}" ] || continue
+        _d="/proc/sys/net/ipv6/conf/${_if}"
+        [ -d "$_d" ] || continue
+        sysctl_write "${_d}/disable_ipv6" "${_dis:-0}"
+        sysctl_write "${_d}/accept_ra" "${_ra:-1}"
+        sysctl_write "${_d}/autoconf" "${_ac:-1}"
+    done < "$v6_stack_saved"
+    rm -f "$v6_stack_saved"
+    log Info "ipv6: previous stack settings restored"
+    return 0
 }
 
 do_on() {
@@ -375,9 +449,10 @@ do_on() {
     apply_proto i4 4
     _v6="$(ipv6_mode)"
     case "$_v6" in
-        proxy) apply_proto i6 6 ;;
-        block) apply_v6_block ;;
-        *)     log Warn "ipv6=off: IPv6 traffic is NOT proxied and can leak" ;;
+        proxy)   apply_proto i6 6 ;;
+        block)   apply_v6_block ;;
+        disable) apply_v6_disable ;;
+        *)       log Warn "ipv6=off: IPv6 traffic is NOT proxied and can leak" ;;
     esac
     # One result line per `on`: the settings are in settings.ini, repeating them
     # on every renew is what made the logs noisy.
@@ -386,6 +461,7 @@ do_on() {
 }
 
 do_off() {  # $1 = quiet (called from do_on, which reinstalls right away)
+    restore_v6_stack
     teardown_proto i4 4
     teardown_proto i6 6
     [ "${1:-}" = "quiet" ] || log Info "TPROXY rules removed"
@@ -404,6 +480,7 @@ do_status() {
     i4 -t mangle -S OUTPUT 2>/dev/null | grep -F PISING || printf '(v4 output none)\n'
     i6 -t mangle -S PREROUTING 2>/dev/null | grep -F PISING || printf '(v6 none)\n'
     printf '== ipv6 mode: %s\n' "$(ipv6_mode)"
+    [ -f "$v6_stack_saved" ] && printf '== ipv6 stack: off on %s interface(s)\n' "$(wc -l < "$v6_stack_saved" | tr -d ' ')"
     printf '== PISING_LOCAL counters\n'
     i4 -t mangle -L "$c_local" -n -v 2>/dev/null || printf '(none)\n'
     return 0
