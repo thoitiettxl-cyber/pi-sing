@@ -28,8 +28,8 @@ fi
         [ "$i" -gt 60 ] && break
     done
 
-    "${DATA}/pi-sing" start
+    "${DATA}/bin/pi-sing" start
     if [ "$watchdog" = "1" ]; then
-        "${DATA}/pi-sing" watchdog
+        "${DATA}/bin/pi-sing" watchdog
     fi
 ) >> "$LOG" 2>&1 &

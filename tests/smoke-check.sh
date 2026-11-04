@@ -14,7 +14,7 @@ FAIL=0
 say() { printf '%-52s %s\n' "$1" "$2"; }
 
 echo "== shell syntax (dash)"
-for f in "${ROOT}"/module/*.sh "${PAYLOAD}/pi-sing" "${PAYLOAD}/pi.iptables" \
+for f in "${ROOT}"/module/*.sh "${PAYLOAD}/bin/pi-sing" "${PAYLOAD}/bin/pi.iptables" \
          "${PAYLOAD}/settings.ini" "${ROOT}"/module/META-INF/com/google/android/update-binary \
          "${HERE}"/*.sh; do
     [ -f "$f" ] || continue
@@ -30,7 +30,7 @@ echo "== config"
 if [ -z "$SB" ] || [ ! -x "$SB" ]; then
     say "sing-box check" "skipped (pass a sing-box binary as \$1)"
 else
-    for c in config.json config.example.json; do
+    for c in config/config.json config/config.example.json; do
         if "$SB" check -D "$PAYLOAD" -c "${PAYLOAD}/${c}" >/tmp/pi-sing-check.err 2>&1; then
             say "$c" "ok ($("$SB" version 2>/dev/null | head -n1))"
         else
@@ -41,8 +41,9 @@ else
 fi
 
 echo "== payload completeness"
-for f in pi-sing pi.iptables settings.ini config.json config.example.json \
-         package.list.cfg ap.list.cfg bin/sing-box; do
+for f in bin/pi-sing bin/pi.iptables settings.ini \
+         config/config.json config/config.example.json \
+         lists/package.list.cfg lists/ap.list.cfg bin/sing-box; do
     if [ -e "${PAYLOAD}/${f}" ]; then
         say "$f" "ok"
     else

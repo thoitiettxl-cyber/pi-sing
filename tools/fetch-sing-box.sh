@@ -45,7 +45,7 @@ echo "${TARBALL_SHA256}  ${TMP}/${TARBALL}" | sha256sum -c - >/dev/null ||
 tar -xzf "${TMP}/${TARBALL}" -C "$TMP"
 mkdir -p "$(dirname "$OUT")"
 cp -f "${TMP}/sing-box-${VERSION}-android-${ABITAG}/sing-box" "$OUT"
-cp -f "${TMP}/sing-box-${VERSION}-android-${ABITAG}/LICENSE" "$(dirname "$OUT")/../sing-box.LICENSE"
+cp -f "${TMP}/sing-box-${VERSION}-android-${ABITAG}/LICENSE" "$(dirname "$OUT")/sing-box.LICENSE"
 chmod 755 "$OUT"
 echo "installed: ${OUT}"
 "$OUT" version 2>/dev/null | head -n 1 || true

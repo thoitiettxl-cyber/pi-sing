@@ -1,12 +1,14 @@
 #!/system/bin/sh
 # Pi-Sing uninstall: remove rules, stop sing-box, delete user data.
 DATA=/data/adb/pi-sing
+CLI="${DATA}/bin/pi-sing"
+RULES="${DATA}/bin/pi.iptables"
 
-if [ -x "${DATA}/pi-sing" ]; then
-    "${DATA}/pi-sing" stop >/dev/null 2>&1
+if [ -x "$CLI" ]; then
+    "$CLI" stop >/dev/null 2>&1
 fi
-if [ -x "${DATA}/pi.iptables" ]; then
-    "${DATA}/pi.iptables" off >/dev/null 2>&1
+if [ -x "$RULES" ]; then
+    "$RULES" off >/dev/null 2>&1
 fi
 
 rm -f /dev/pi-sing

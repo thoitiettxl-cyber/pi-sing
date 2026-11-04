@@ -12,10 +12,13 @@ PISING_DIR="${PISING_DIR:-/data/adb/pi-sing}"
 settings="${PISING_DIR}/settings.ini"
 [ -f "$settings" ] || { printf 'pi-sing: settings not found: %s\n' "$settings" >&2; exit 1; }
 . "$settings"
+# bin_dir/config_dir/run_dir come from settings.ini; refuse an old one instead of
+# resolving paths against "/".
+[ -n "${bin_dir:-}" ] && [ -n "${config_dir:-}" ] && [ -n "${run_dir:-}" ] ||
+    { printf 'pi-sing: %s is from an older layout, reinstall the module\n' "$settings" >&2; exit 1; }
 
-bin_path="${data_dir}/bin/${bin_name}"
-config_path="${data_dir}/${config_file}"
-run_dir="${data_dir}/run"
+bin_path="${bin_dir}/${bin_name}"
+config_path="${config_dir}/${config_file}"
 pid_file="${run_dir}/pi-sing.pid"
 log_file="${run_dir}/pi-sing.log"
 mod_dir="/data/adb/modules/pi-sing"
@@ -188,7 +191,7 @@ sync_config() {
 
 # sing-box validates the config (schema + rule sets) before we touch any rule.
 check_config() {
-    "$bin_path" check -D "$data_dir" -c "$config_path" >> "$log_file" 2>&1
+    "$bin_path" check -D "$run_dir" -c "$config_path" >> "$log_file" 2>&1
 }
 
 # Start the core as ${core_user}:${core_group} so pi.iptables can bypass it by
@@ -238,7 +241,7 @@ do_start() {
     fi
     rotate_log
     printf '\n==== %s start ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$log_file"
-    start_core "$bin_path" run -D "$data_dir" -c "$config_path"
+    start_core "$bin_path" run -D "$run_dir" -c "$config_path"
     sleep 2
     _pid="$(find_pid)"
     if [ -z "${_pid:-}" ]; then
@@ -248,7 +251,7 @@ do_start() {
     fi
     printf '%s\n' "$_pid" > "$pid_file"
     log Info "sing-box running (pid ${_pid})"
-    "${data_dir}/pi.iptables" on >> "$log_file" 2>&1 || {
+    "${bin_dir}/pi.iptables" on >> "$log_file" 2>&1 || {
         log Error "failed to install TPROXY rules"
         update_desc "rules error"
         return 1
@@ -259,7 +262,7 @@ do_start() {
 }
 
 do_stop() {
-    "${data_dir}/pi.iptables" off >> "$log_file" 2>&1
+    "${bin_dir}/pi.iptables" off >> "$log_file" 2>&1
     _pid="$(running_pid)"
     if [ -n "${_pid:-}" ]; then
         kill -15 "$_pid" 2>/dev/null
@@ -320,7 +323,7 @@ do_watchdog() {
         if [ -n "$_cur" ] && [ "$_cur" != "$_iface" ]; then
             if [ -n "$_iface" ]; then
                 log Info "default interface ${_iface} -> ${_cur}, renewing rules"
-                "${data_dir}/pi.iptables" renew >> "$log_file" 2>&1
+                "${bin_dir}/pi.iptables" renew >> "$log_file" 2>&1
             fi
             _iface="$_cur"
         fi
@@ -333,7 +336,7 @@ case "${1:-}" in
     restart)  do_stop; do_start ;;
     status)   do_status ;;
     log)      shift; do_log "${1:-40}" ;;
-    iptables) shift; "${data_dir}/pi.iptables" "${1:-status}" ;;
+    iptables) shift; "${bin_dir}/pi.iptables" "${1:-status}" ;;
     watchdog) do_watchdog ;;
     *)
         printf 'usage: %s {start|stop|restart|status|log [n]|iptables <on|off|renew|status>|watchdog}\n' "$0" >&2

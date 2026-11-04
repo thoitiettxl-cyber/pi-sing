@@ -19,9 +19,10 @@ rm -f "$OUT"
 cd "$MOD"
 FILES="module.prop customize.sh service.sh action.sh uninstall.sh
 META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script"
-PAYLOAD="payload/settings.ini payload/config.json payload/config.example.json
-payload/package.list.cfg payload/ap.list.cfg payload/pi-sing payload/pi.iptables
-payload/sing-box.LICENSE payload/bin/sing-box"
+PAYLOAD="payload/settings.ini payload/config/config.json payload/config/config.example.json
+payload/lists/package.list.cfg payload/lists/ap.list.cfg
+payload/bin/pi-sing payload/bin/pi.iptables payload/bin/sing-box.LICENSE
+payload/bin/sing-box"
 
 if command -v zip >/dev/null 2>&1; then
     # shellcheck disable=SC2086
@@ -53,3 +54,8 @@ with zipfile.ZipFile(sys.argv[1]) as z:
     for n in names:
         print("   ", n)
 PY
+
+# The installer is the only thing that knows the on-device layout; exercise it
+# against the zip that was just built (fresh install + migration from v1.0.0).
+echo
+bash "${ROOT}/tests/installer-test.sh" "$OUT"

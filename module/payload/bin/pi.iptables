@@ -30,6 +30,8 @@ log_file="${run_dir}/iptables.log"
 
 [ -f "$settings" ] || { printf 'pi.iptables: settings not found: %s\n' "$settings" >&2; exit 1; }
 . "$settings"
+[ -n "${list_dir:-}" ] ||
+    { printf 'pi.iptables: %s is from an older layout, reinstall the module\n' "$settings" >&2; exit 1; }
 
 mkdir -p "$run_dir" 2>/dev/null
 
@@ -76,7 +78,7 @@ local_addrs() {
 # Resolve package.list.cfg entries to uids in ${uid_file}.
 read_uid_list() {
     : > "$uid_file" 2>/dev/null
-    pkg_cfg="${PISING_DIR}/package.list.cfg"
+    pkg_cfg="${list_dir}/package.list.cfg"
     [ -f "$pkg_cfg" ] || return 0
     entries="$(awk '
         function trim(s) { gsub(/^[ \t\r]+/, "", s); gsub(/[ \t\r]+$/, "", s); return s }
@@ -116,7 +118,7 @@ read_uid_list() {
 
 read_ap_list() {
     : > "${run_dir}/ap.list" 2>/dev/null
-    cfg="${PISING_DIR}/ap.list.cfg"
+    cfg="${list_dir}/ap.list.cfg"
     [ -f "$cfg" ] || return 0
     awk '/^[ \t]*allow[ \t]+/ { print $2 }' "$cfg" >> "${run_dir}/ap.list"
     return 0

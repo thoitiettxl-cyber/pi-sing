@@ -22,9 +22,9 @@ These are not style preferences; each one prevents a concrete failure.
    `sleep N; [ -f run/keep ] || pi-sing stop` in the background, then apply, then
    verify, then `touch run/keep`. If anything looks wrong, `pi-sing stop` through
    the bridge — the bridge is a unix socket, it works without a network.
-4. **Never commit credentials.** `module/payload/config.json` is a **template**
+4. **Never commit credentials.** `module/payload/config/config.json` is a **template**
    with dummy keys and `203.0.113.10`. The real config lives only at
-   `/data/adb/pi-sing/config.json` on the phone and is never copied into the repo.
+   `/data/adb/pi-sing/config/config.json` on the phone and is never copied into the repo.
    `customize.sh` keeps an existing config on upgrade, so the template is only
    used on a fresh install.
 5. **One command per `su -c`.** `su -c 'a; b'` over android-bridge runs in the
@@ -43,24 +43,40 @@ module/service.sh             boot service: wait for sys.boot_completed + defaul
 module/action.sh              manager action button -> toggle
 module/uninstall.sh           stop, drop rules, delete /data/adb/pi-sing
 module/META-INF/.../update-binary   unmodified Magisk module_installer.sh (GPL-3.0)
-module/payload/pi-sing        CLI: start|stop|restart|status|log|iptables|watchdog
-module/payload/pi.iptables    rules: on|off|renew|status
 module/payload/settings.ini   the only knobs; sourced by both scripts
-module/payload/config.json    sing-box config TEMPLATE (no real credentials)
-module/payload/config.example.json   minimal direct-outbound config
-module/payload/package.list.cfg      per-app list (uid or package[:user])
-module/payload/ap.list.cfg           interfaces whose ingress is proxied
+module/payload/bin/pi-sing    CLI: start|stop|restart|status|log|iptables|watchdog
+module/payload/bin/pi.iptables  rules: on|off|renew|status
 module/payload/bin/sing-box   NOT committed; tools/fetch-sing-box.sh
+module/payload/config/config.json       TEMPLATE (no real credentials)
+module/payload/config/config.example.json  minimal direct-outbound config
+module/payload/lists/package.list.cfg   per-app list (uid or package[:user])
+module/payload/lists/ap.list.cfg        interfaces whose ingress is proxied
 tools/fetch-sing-box.sh       pinned release + sha256
 tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip
 tests/smoke-check.sh           sh -n on every script + sing-box check on both configs
 tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (14 assertions)
+tests/installer-test.sh       customize.sh on the host: fresh install, v1.0.0 layout
+                              migration, stale watchdog (SIGTERM ignored), idempotency
 ```
 
 On the device: module scripts in `/data/adb/modules/pi-sing`, everything that can
-change in `/data/adb/pi-sing` (`settings.ini`, `config.json`, the two lists,
-`pi-sing`, `pi.iptables`, `bin/sing-box`, `run/`). `/dev/pi-sing` is a symlink to
-the CLI.
+change in `/data/adb/pi-sing`:
+
+```
+settings.ini            only real file at the top (defines bin_dir, config_dir,
+                        list_dir, run_dir)
+bin/                    pi-sing, pi.iptables, sing-box, sing-box.LICENSE
+config/                 config.json, config.example.json
+lists/                  package.list.cfg, ap.list.cfg
+run/                    pid, logs, generated lists, sing-box cache (-D run/)
+pi-sing, pi.iptables    symlinks to bin/ -- required until the next reboot,
+                        see the traps below
+```
+
+`/dev/pi-sing` is a symlink to `bin/pi-sing`. The flat v1.0.0 layout is migrated
+by `customize.sh`, which appends the `*_dir` block to an old `settings.ini`
+(existing values untouched). Without that block `pi-sing`/`pi.iptables` refuse to
+run — deriving `bin_dir` on "/" would be a silent misconfiguration.
 
 ## Rule contract (do not reorder without re-measuring)
 
@@ -126,6 +142,15 @@ A useful device check set (all must hold):
 - KernelSU's installer does not extract `module.prop` when `SKIPUNZIP=1`.
 - `pidof`/`pgrep`/`ss`/`curl`/`awk`/`sed`/`sort` exist on the target ROM; busybox
   is at `/data/adb/ksu/bin/busybox` (found by explicit path, not via PATH).
+- **toybox `pgrep -f "a b"` matches `a` OR `b`** (measured: the pattern
+  `"pi-sing watchdog"` also listed `sing-box`). Match a full command line by
+  reading `/proc/<pid>/cmdline` instead; never `pkill` from a split pattern.
+- **The watchdog loop survives SIGTERM** (measured: `kill -15` returned 0 and the
+  `sh` stayed in its `sleep`, its `sleep` child died). Escalate to SIGKILL.
+- KernelSU 3.3.1 stages a module update in `/data/adb/modules_update` and applies
+  `service.sh`/`action.sh` only on the next boot. Between an in-app upgrade and a
+  reboot the previous boot script still runs, which is why `customize.sh` keeps
+  `/data/adb/pi-sing/pi-sing` as a symlink into `bin/`.
 
 ## Release
 

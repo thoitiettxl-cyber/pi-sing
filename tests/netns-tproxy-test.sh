@@ -65,15 +65,16 @@ iptables -I FORWARD -o "$HOST_VETH" -j ACCEPT
 ok "namespace ${NS} up, ${SUBNET} masqueraded"
 
 echo "== payload"
-mkdir -p "$DATA/bin" "$DATA/run"
-cp "$PAYLOAD/pi-sing" "$PAYLOAD/pi.iptables" "$PAYLOAD/settings.ini" \
-   "$PAYLOAD/package.list.cfg" "$PAYLOAD/ap.list.cfg" "$DATA/"
-cp "$PAYLOAD/config.example.json" "$DATA/config.json"
+mkdir -p "$DATA/bin" "$DATA/config" "$DATA/lists" "$DATA/run"
+cp "$PAYLOAD/bin/pi-sing" "$PAYLOAD/bin/pi.iptables" "$DATA/bin/"
+cp "$PAYLOAD/settings.ini" "$DATA/"
+cp "$PAYLOAD/config/config.example.json" "$DATA/config/config.json"
+cp "$PAYLOAD/lists/package.list.cfg" "$PAYLOAD/lists/ap.list.cfg" "$DATA/lists/"
 cp "$SINGBOX_BIN" "$DATA/bin/sing-box"
 # The payload targets Android (/system/bin/sh); point it at the host shell here.
-sed -i '1s|.*|#!/bin/sh|' "$DATA/pi-sing" "$DATA/pi.iptables"
+sed -i '1s|.*|#!/bin/sh|' "$DATA/bin/pi-sing" "$DATA/bin/pi.iptables"
 # Readable logs + a plain UDP resolver (DoH to 1.1.1.1 is blocked in CI/sandboxes).
-python3 - "$DATA/config.json" <<'PY'
+python3 - "$DATA/config/config.json" <<'PY'
 import json, sys
 p = sys.argv[1]
 c = json.load(open(p))
@@ -82,14 +83,14 @@ c['dns']['servers'] = [{"type": "udp", "tag": "dns-remote", "server": "100.100.1
                        {"type": "local", "tag": "dns-local"}]
 json.dump(c, open(p, 'w'), indent=2)
 PY
-chmod +x "$DATA/pi-sing" "$DATA/pi.iptables" "$DATA/bin/sing-box"
+chmod +x "$DATA/bin/pi-sing" "$DATA/bin/pi.iptables" "$DATA/bin/sing-box"
 
 echo "== start"
-ns env PISING_DIR="$DATA" "$DATA/pi-sing" start
+ns env PISING_DIR="$DATA" "$DATA/bin/pi-sing" start
 [ $? -eq 0 ] && ok "pi-sing start" || bad "pi-sing start"
 grep -q 'core runs as' "$LOG" && ok "core started with a dedicated gid ($(grep -o 'core runs as.*' "$LOG" | tail -1))" ||
     bad "core gid bypass not active"
-ns env PISING_DIR="$DATA" "$DATA/pi-sing" status | sed 's/^/  /'
+ns env PISING_DIR="$DATA" "$DATA/bin/pi-sing" status | sed 's/^/  /'
 
 echo "== TCP through tproxy"
 BEFORE=$(count_inbound)
@@ -119,8 +120,8 @@ grep -q 'rcode=0' "${TMP}/dns.out" && ok "UDP/53 answered by sing-box ($(tr -d '
 
 echo "== per-app blacklist"
 if command -v setpriv >/dev/null 2>&1; then
-    printf '12345\n' >> "$DATA/package.list.cfg"
-    ns env PISING_DIR="$DATA" "$DATA/pi.iptables" renew >/dev/null 2>&1
+    printf '12345\n' >> "$DATA/lists/package.list.cfg"
+    ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
     ns iptables -t mangle -S PISING_LOCAL | grep -q -- '--uid-owner 12345 -j RETURN' &&
         ok "uid 12345 returns before the mark rules" || bad "uid 12345 return rule missing"
     U1=$(count_inbound)
@@ -134,19 +135,19 @@ fi
 
 echo "== per-app whitelist"
 sed -i 's/^proxy_mode=.*/proxy_mode="whitelist"/' "$DATA/settings.ini"
-ns env PISING_DIR="$DATA" "$DATA/pi.iptables" renew >/dev/null 2>&1
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
 ns iptables -t mangle -S PISING_LOCAL | grep -q -- '-p tcp -m owner --uid-owner 12345 -j MARK' &&
     ok "uid 12345 is marked in whitelist mode" || bad "whitelist mark rule missing"
 ns iptables -t mangle -S PISING_LOCAL | grep -q -- '0.0.0.0/0.*MARK or 0x200000' &&
     bad "whitelist mode still marks every app" || ok "unlisted uids stay direct in whitelist mode"
 sed -i 's/^proxy_mode=.*/proxy_mode="blacklist"/' "$DATA/settings.ini"
-ns env PISING_DIR="$DATA" "$DATA/pi.iptables" renew >/dev/null 2>&1
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
 
 echo "== counters"
 ns iptables -t mangle -L PISING_LOCAL -n -v 2>/dev/null | head -n 10 | sed 's/^/  /'
 
 echo "== stop"
-ns env PISING_DIR="$DATA" "$DATA/pi-sing" stop
+ns env PISING_DIR="$DATA" "$DATA/bin/pi-sing" stop
 ns iptables -t mangle -S 2>/dev/null | grep -q PISING && bad "PISING chains left after stop" || ok "all PISING chains removed"
 [ -z "$(ns ip rule show 2>/dev/null | grep -F 'lookup 2027')" ] && ok "ip rule removed" || bad "ip rule still present"
 ns pidof sing-box >/dev/null 2>&1 && bad "sing-box still running" || ok "sing-box stopped"

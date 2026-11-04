@@ -36,6 +36,10 @@ Host-side tests, run on the same kernel:
 tests/smoke-check.sh                  every script parses (dash), both configs pass `sing-box check` 1.14.4
 tests/netns-tproxy-test.sh            14/14 — TCP, UDP/53 hijack, per-app blacklist + whitelist,
                                       core-gid bypass (no capture loop), clean teardown
+tests/installer-test.sh               31/31 — fresh install, migration from the v1.0.0 flat
+                                      layout (kept files, moved cache, appended paths),
+                                      idempotent re-run, stale watchdog killed,
+                                      old settings.ini rejected
 ```
 
 Not verified: the `ipv6=proxy` mode (this tunnel carries IPv4 only — measured),
@@ -53,15 +57,15 @@ module/                     -> inside the zip
   uninstall.sh              stop, remove rules, delete /data/adb/pi-sing
   META-INF/.../update-binary   upstream Magisk module_installer.sh (GPL-3.0)
   payload/
-    pi-sing                 CLI: start|stop|restart|status|log|iptables|watchdog
-    pi.iptables             TPROXY rules: on|off|renew|status
     settings.ini            every tunable (sourced, POSIX sh)
-    config.json             sing-box config (see "leak-free config" below)
-    config.example.json     minimal config: tproxy inbound + direct outbound
-    package.list.cfg        per-app list (blacklist/whitelist)
-    ap.list.cfg             interfaces whose incoming traffic is proxied
-    bin/sing-box            the Android arm64 binary
-tests/  netns-tproxy-test.sh, smoke-check.sh
+    bin/  pi-sing           CLI: start|stop|restart|status|log|iptables|watchdog
+          pi.iptables       TPROXY rules: on|off|renew|status
+          sing-box          the Android arm64 binary
+    config/  config.json    sing-box config (see "leak-free config" below)
+             config.example.json   minimal config: tproxy inbound + direct outbound
+    lists/   package.list.cfg    per-app list (blacklist/whitelist)
+             ap.list.cfg         interfaces whose incoming traffic is proxied
+tests/  netns-tproxy-test.sh, smoke-check.sh, installer-test.sh
 tools/  build.sh            -> dist/Pi-Sing-<version>.zip
 ```
 
@@ -84,14 +88,29 @@ On the device:
 
 ```
 /data/adb/modules/pi-sing/      module.prop, service.sh, action.sh, uninstall.sh
-/data/adb/pi-sing/              everything that changes
-  settings.ini config.json package.list.cfg ap.list.cfg pi-sing pi.iptables bin/sing-box
-  run/  pi-sing.log iptables.log service.log appuid.list core.gid pi-sing.pid ap.list
-/dev/pi-sing -> /data/adb/pi-sing/pi-sing
+/data/adb/pi-sing/              everything that changes, grouped by purpose
+  settings.ini                  the only real file at the top: every knob
+  bin/                          pi-sing, pi.iptables, sing-box, sing-box.LICENSE
+  config/                       config.json, config.example.json
+  lists/                        package.list.cfg, ap.list.cfg
+  run/                          pid, logs, generated lists, sing-box cache.db
+  pi-sing, pi.iptables          symlinks to bin/ (see the upgrade note)
+/dev/pi-sing -> /data/adb/pi-sing/bin/pi-sing
 ```
 
-Upgrades replace `pi-sing`, `pi.iptables`, `bin/sing-box`; `settings.ini`,
-`config.json` and the two list files are kept.
+`bin/` and `config/config.example.json` are replaced on upgrade; `settings.ini`,
+`config/config.json` and the two files in `lists/` are kept. An install from the
+old flat layout is moved into these directories by `customize.sh` (existing
+values untouched), and an older `settings.ini` gets the `*_dir` block appended —
+it does not have one, so the scripts would otherwise refuse to guess.
+
+`pi-sing` and `pi.iptables` at the top of the data dir are symlinks into `bin/`
+because the manager (measured with KernelSU 3.3.1) stages a module update in
+`/data/adb/modules_update` and applies its `service.sh`/`action.sh` only on the
+next boot: until then the previous boot script runs, and it calls
+`/data/adb/pi-sing/pi-sing`. Without the link the module cannot start between an
+in-app upgrade and a reboot. A watchdog loop from the previous version is killed
+by the installer (SIGTERM then SIGKILL — the loop survives SIGTERM on this ROM).
 
 ## Usage
 
@@ -181,18 +200,20 @@ Routing: `ip rule add fwmark <fwmark> table 2027 pref 110` plus
 
 ## Leak-free sing-box config (`config.json`)
 
-`module/payload/config.json` is a **template**: a WireGuard endpoint with dummy
-keys and `203.0.113.10` as the peer, fakeip DNS, a Clash API, two remote
+`module/payload/config/config.json` is a **template**: a WireGuard endpoint with
+dummy keys and `203.0.113.10` as the peer, fakeip DNS, a Clash API, two remote
 rule-sets. It is only used on a fresh install — `customize.sh` never overwrites an
-existing `/data/adb/pi-sing/config.json`, so a real config on the phone is kept
-across upgrades. Never commit real credentials.
+existing `/data/adb/pi-sing/config/config.json`, so a real config on the phone is
+kept across upgrades. Never commit real credentials.
 
 The template already contains the five things TPROXY on Android needs. If you
 write your own config, keep the equivalent:
 
 1. No `log.output` — the module redirects sing-box to
    `/data/adb/pi-sing/run/pi-sing.log` (an absolute path to a directory that does
-   not exist on the phone is fatal).
+   not exist on the phone is fatal). Likewise every relative path in the config
+   (`cache_file.path`) resolves inside `/data/adb/pi-sing/run/`, because `pi-sing`
+   runs the core with `-D /data/adb/pi-sing/run`.
 2. One `{"type": "tproxy"}` inbound; its `listen_port` is owned by
    `settings.ini` (`pi-sing start` rewrites it).
 3. `route.default_domain_resolver` must be a **tunnel-side** DNS server, so every
