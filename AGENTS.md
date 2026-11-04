@@ -186,9 +186,9 @@ Host (this container; kernel has xt_TPROXY, `ip netns` works):
 ```
 SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
 SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 23/23 expected
-tests/update-core-test.sh                           # 38/38 expected, no device
-tests/installer-test.sh                             # 66/66 expected, no device
-tests/cli-test.sh                                   # 29/29 expected, no device
+tests/update-core-test.sh                           # 44/44 expected, no device
+tests/installer-test.sh                             # 67/67 expected, no device
+tests/cli-test.sh                                   # 30/30 expected, no device
 tests/action-test.sh                                # 32/32 expected, no device
 tools/build.sh                                      # smoke + the module zip (no core)
 ```
@@ -200,6 +200,38 @@ S=/run/android-bridge/bridge.sock            # may also appear as /run/android-b
 android-bridge -s $S -T su -c 'sh /data/local/tmp/x.sh'
 android-bridge -s $S push ./local-file /data/local/tmp/local-file   # then su cp into /data/adb
 ```
+
+### Touching rules on the live phone: one revert, one process
+
+The phone is the agent's own uplink and the container reaches the internet
+through it, so every rules experiment needs a way back that does not depend on
+the agent staying connected.
+
+```
+rm -f /data/adb/pi-sing/run/keep
+nohup setsid sh -c "sleep 150; [ -f /data/adb/pi-sing/run/keep ] || /data/adb/pi-sing/bin/pi-sing stop" &
+echo $! > /data/local/tmp/revert.pid        # always remember which one
+... apply, verify ...
+touch /data/adb/pi-sing/run/keep
+```
+
+- **Exactly one armed revert at a time.** Measured failure: a second script's
+  `rm -f run/keep` re-armed the *first* killer, it woke up mid-test, ran
+  `pi-sing stop`, and the module looked like it had crashed on its own (card went
+  🔴, rules 0, core stopped). Kill the previous killer by pid before arming a new
+  one, or reuse the same script.
+- **A stale `run/keep` silently disables the next revert** (the killer finds it
+  and does nothing). `rm -f run/keep` at the start of every rules run.
+- Verify from *both* sides: `pi-sing status` on the phone **and**
+  `curl -4 https://api.ipify.org` in the container. If the container's IP stops
+  matching the phone's, stop the module before investigating anything else.
+- `PISING_DRY_RUN=1 pi.iptables on` prints every command it would run and leaves
+  the rule set byte-identical (measured: mangle table md5 unchanged, 81 lines) —
+  use it before installing rules on an unfamiliar ROM.
+- Never `pkill -f <path>` and never trust `pgrep -f` alone: the Droidspaces
+  container shares the phone's PID namespace, so the pattern matches the shell
+  running the command (measured: exit 137). Kill by the pid in `run/pi-sing.pid`
+  and check `is_core_pid` (it reads `/proc/<pid>/cmdline`).
 
 A useful device check set (all must hold):
 
@@ -274,6 +306,22 @@ A useful device check set (all must hold):
   and `stop` SIGKILLed it (the agent's own shell, exit 137). Never `pkill -f` a
   path from a bridge command either: the pattern matches the command you are
   running.
+- **A DNS server's own transport ignores `route.final`.** In 1.12+ a DNS server
+  dials "just like an outbound", which the docs call *equivalent to an empty
+  direct outbound*: without `detour` the DoH/DoT query leaves the phone directly
+  even when `final` is a proxy. Measured on the host with 1.14.4: a server with
+  `"detour": "blocked"` fails (`operation not permitted`), the same server
+  without `detour` works while `route.final` is a `block` outbound. On the phone a
+  leak test showed the carrier-side resolvers until `remote_dns` got
+  `"detour": "Soul_🌐"`; the debug log then printed
+  `endpoint/wireguard[Proton-US_🔒]: outbound connection to 8.8.8.8:443`.
+  `route.default_domain_resolver` is **not** this knob: it only sets the resolver
+  outbounds use for the domains *they* dial (docs Dial Fields).
+- **The release JSON is one line of compact JSON** (285 079 bytes measured) and
+  toybox `sed`/`awk` give up on a line that long, so a layout-based parse finds
+  nothing. `update-core` now joins the payload into one line and splits it at
+  every `{` first, and a missing `digest` warns instead of refusing (sing-box's
+  tarballs have no digest; only its APK assets do).
 - **`sing-box check` does not open `log.output`, `run` does.** Measured with a
   box_for_magisk config (2026-11-04): `check` exits 0, then `run` dies with
   `start logger: open /data/adb/box/run/sing-box.log: no such file or directory`
@@ -298,7 +346,12 @@ A useful device check set (all must hold):
    response when the asset has one; sing-box's tarballs do not, so that path
    warns and verifies by tag + `check`). A core in `module/payload/bin/` (from `tools/fetch-sing-box.sh`,
    needed by the host tests) is not copied into the zip.
-3. `SINGBOX_BIN=... tests/netns-tproxy-test.sh` and the device check set above.
+3. Check the zip before publishing: `python3 -c "import zipfile;z=zipfile.ZipFile('<zip>');print(len(z.namelist()))"`
+   must print **15** and the largest entry must be `payload/bin/pi-sing` (~32 KiB).
+   A `config/ui/` directory inside `module/payload/config/` once shipped 6.7 MB of
+   dashboard assets that way (v1.7.0); the dashboard belongs to sing-box and is
+   downloaded at runtime, never committed.
+4. `SINGBOX_BIN=... tests/netns-tproxy-test.sh` and the device check set above.
    `tools/build.sh` already runs smoke + cli-test + action-test + installer-test.
 5. Commit subject: `pi-sing: <what changed>`; body explains the measurement, not
    the intention.
