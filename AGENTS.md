@@ -58,6 +58,9 @@ tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (14 assertions)
 tests/cli-test.sh             host, stub core: dashboard resolution (relative /
                               object / absolute), core_log_level, 🟢/🔴 description,
                               log split/rotation, watchdog vs a user stop (27)
+tests/action-test.sh          host: fail-closed state (rules stay, core dies) and
+                              the action button's one-press OFF, the 🟠 card, the
+                              watchdog not repainting 🟢 over it (24)
 tests/installer-test.sh       customize.sh on the host: fresh install, wrapper files
                               (no symlinks), v1.0.0 migration, run/ui -> config/ui,
                               stale watchdog (SIGTERM ignored), idempotency, volume
@@ -133,6 +136,7 @@ SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 14/14 expected
 tests/update-core-test.sh                           # 29/29 expected, no device
 tests/installer-test.sh                             # 63/63 expected, no device
 tests/cli-test.sh                                   # 27/27 expected, no device
+tests/action-test.sh                                # 24/24 expected, no device
 tools/build.sh --all                                # smoke + full and thin zips
 ```
 
@@ -185,6 +189,14 @@ A useful device check set (all must hold):
   writes `run/stopped` before killing the core, `start` removes it, and the
   watchdog loop skips restart *and* rule renewal while it exists. Without the flag,
   the action button's OFF came back at the next 30 s tick (measured).
+- **"ON" means the TPROXY rules are installed, not just "a core is running".** A
+  start whose self-test fails keeps the rules (fail closed, no leak) and the core
+  can exit a moment later, so `process : stopped` + `iptables : hooked` is a
+  normal state. Deciding the toggle on the process alone made the next press run
+  `start` again: the rules were never removed, the phone had no internet, and the
+  only way back was uninstalling the module (whose `uninstall.sh` runs `stop`) and
+  rebooting (measured on a user report, `2026-11-04`). `run/selftest.failed` keeps
+  the card 🟠 so the watchdog cannot paint it 🟢 while the tunnel is unproven.
 - **`find_pid` must fall back to `pgrep -f "$bin_path"`** when `pidof` finds
   nothing: pidof matches the kernel comm, which is not `bin_name` for a wrapper.
 - **`--disable-color` is detected, not assumed** (`run --help | grep`), and the log
@@ -207,6 +219,7 @@ A useful device check set (all must hold):
    (volume keys, `PISING_INSTALL_CORE=1|0` to answer without a key) before
    downloading one with `update-core`.
 4. `SINGBOX_BIN=... tests/netns-tproxy-test.sh` and the device check set above.
-   `tools/build.sh --all` already runs smoke + cli-test + installer-test.
+   `tools/build.sh --all` already runs smoke + cli-test + action-test +
+   installer-test.
 5. Commit subject: `pi-sing: <what changed>`; body explains the measurement, not
    the intention.

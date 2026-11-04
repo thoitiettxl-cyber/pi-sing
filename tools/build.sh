@@ -85,10 +85,13 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         print("   ", n)
 PY
 
-    # The CLI behaviour (dashboard path, log split, description) needs no device,
-    # and the installer is the only thing that knows the on-device layout.
+    # The CLI behaviour (dashboard path, log split, description), the action
+    # button's fail-closed recovery, and the installer (the only thing that
+    # knows the on-device layout) all run without a device.
     echo
     bash "${ROOT}/tests/cli-test.sh"
+    echo
+    bash "${ROOT}/tests/action-test.sh"
     echo
     bash "${ROOT}/tests/installer-test.sh" "$OUT"
 }

@@ -165,6 +165,13 @@ su -c /dev/pi-sing update-core  # install the latest sing-box from GitHub
 `action.sh` (manager action button) does the same toggle and ends with
 `Pi-Sing is ON` / `Pi-Sing is OFF`.
 
+The button counts a rule set that is still installed as **ON**, not just a
+running core: a start whose self-test fails keeps the rules (fail closed) and the
+core can die afterwards, which used to look "stopped" — so the next press started
+the core again, the rules were never removed, and the phone stayed offline until
+the module was uninstalled. One press now always reaches a real OFF (rules
+removed, core stopped), and `Pi-Sing is OFF` is only printed when both are gone.
+
 `stop` writes `run/stopped`; `start` removes it. The watchdog restarts a **crashed**
 core but leaves a **user-stopped** one alone — before this, the action button's
 OFF was undone at the next 30 s tick.
@@ -175,7 +182,8 @@ OFF was undone at the next 30 s tick.
   Every state change writes one line, the way
   [`android-bridge`](https://github.com/ravindu644/android-bridge) does:
   `🟢 Running (pid …) | sing-box + TPROXY blacklist, 1536`,
-  `🔴 Stopped`, `🟠 Running - tunnel down`, `🔴 Config error`, `🔴 No core`,
+  `🔴 Stopped`, `🟠 Tunnel down - tap to stop` (rules stay, fail closed),
+  `🟠 Rules off (selftest)`, `🔴 Config error`, `🔴 No core`,
   `🔴 Disabled (enabled=0)`, `⚪ Installed - reboot to start`.
   The watchdog only rewrites the file when the state changes.
 - **`run/log/module.log`** — one line per module event, `[cli]` or `[rules]` or
@@ -213,9 +221,12 @@ once, instead of downloading it again. `pi-sing status` prints the resolved path
 
 `start` runs a **self-test** after installing the rules: one request from a socket
 the rules exempt (direct) and one the rules must capture (proxied). Direct OK +
-proxied failing means the tunnel is down → rules stay (fail closed, no leak).
-Both failing means the rules themselves are wrong → they are removed so the phone
-keeps its connection. `selftest=0` disables it.
+proxied failing means the tunnel is down → rules stay (fail closed, no leak), and
+the card says `🟠 Tunnel down - tap to stop`: the phone is offline until the
+tunnel is fixed or the proxy is turned off. `run/selftest.failed` records that
+state, so the watchdog cannot repaint the card `🟢`; the next start that passes
+clears it. Both failing means the rules themselves are wrong → they are removed
+so the phone keeps its connection. `selftest=0` disables it.
 
 ## Updating the core
 
