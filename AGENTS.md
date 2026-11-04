@@ -362,6 +362,16 @@ A useful device check set (all must hold):
   something), and never `read ... || continue` — a `/proc/sys` value has no
   trailing newline, so dash returns 1 there while still setting the variable
   (measured: every interface read "1" and nothing was fixed).
+  **The cadence matters as much as the cost.** `v6enforce` once per tick left a
+  window as wide as `watchdog_interval`: measured 2026-11-05, switching wifi ->
+  4G and running a leak test inside those 30 s answered from the carrier's
+  resolvers (`Viettel 171.225.222.19/.20`) while the card stayed 🟢, and only the
+  next tick closed it — so a fast switch always leaked. The loop now wakes on a
+  2 s slice and calls `v6_drift` first (one `ip route get`, measured 4.5 ms, and
+  one `/proc` read of the uplink's `disable_ipv6`); a drifted uplink is fixed in
+  ≤2 s (measured 0.1 s / 1.1 s / 1.6 s over three runs), an idle loop costs 70 ms
+  of CPU per minute (measured over 60 s), and an interface that is not the uplink
+  still waits for the tick (measured: `ds-br0` fixed in 7 s).
   `all/disable_ipv6` must still stay untouched: writing it cascades to `lo` and
   kills `::1` (measured).
 - **A resolver that dies while the tunnel still works is a leak, not a tunnel

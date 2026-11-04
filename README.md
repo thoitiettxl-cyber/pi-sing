@@ -300,7 +300,7 @@ unchanged.
 | --- | --- | --- |
 | `enabled` | `1` | start at boot from `service.sh` |
 | `selftest` | `1` | probe direct + proxied after start, see above |
-| `watchdog` / `watchdog_interval` | `1` / `30` | restart a dead core, renew rules when the default route interface changes |
+| `watchdog` / `watchdog_interval` | `1` / `30` | restart a dead core, renew rules when the default route interface changes, keep IPv6 off within ~2 s of netd turning it back on (the loop wakes on a 2 s slice for that one check; the rest of the tick still runs on the interval) |
 | `tproxy_port` | `1536` | tproxy inbound port; `pi-sing start` rewrites the tproxy inbound's `listen_port` |
 | `fwmark` | `0x00200000/0x00200000` | mark set by TPROXY, matched by `ip rule` (outside the `0x0–0x1ffff` range netd uses) |
 | `own_mark` / `routing_mark` | `0x00400000` / `4194304` | optional second loop guard (`outbound.routing_mark`) |

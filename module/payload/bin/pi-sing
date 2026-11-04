@@ -785,6 +785,28 @@ do_update_core() {
     return 0
 }
 
+# ipv6=disable keeps netd from resolving through a resolver the hijack cannot
+# reach, and netd turns the stack back on the moment a network comes up. Fixing
+# that only once per interval left a window as long as the interval: measured
+# 2026-11-05 on wifi -> 4G, a leak test inside that window answered from the
+# carrier's resolvers (Viettel 171.225.222.19/.20) while the card stayed 🟢, and
+# the next tick closed it. This probe is one `ip route get` (measured 4.5 ms)
+# plus one /proc read, so the loop can afford it every 2 s; the full
+# `v6enforce` (measured 35 ms) keeps its own cadence and also fixes interfaces
+# that are not the uplink.
+v6_drift() {
+    case "${ipv6:-off}" in disable|-1|none) ;; *) return 1 ;; esac
+    _d_if="$(ip route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+    [ -n "${_d_if:-}" ] || return 1
+    _d="/proc/sys/net/ipv6/conf/${_d_if}"
+    [ -f "${_d}/disable_ipv6" ] || return 1
+    # A /proc/sys value has no trailing newline, so `read` returns 1 while still
+    # setting the variable (measured on the device): never chain it with `||`.
+    read -r _d_v6 < "${_d}/disable_ipv6" 2>/dev/null
+    [ "${_d_v6:-1}" = "1" ] && return 1
+    return 0
+}
+
 do_watchdog() {
     [ "$watchdog" = "1" ] || { log Info "watchdog disabled"; return 0; }
     log Info "watchdog started (${watchdog_interval}s)"
@@ -798,8 +820,23 @@ do_watchdog() {
     _iface=""
     _nocore=0
     _last=""
+    # The loop wakes on the short slice so `v6_drift` can catch netd quickly;
+    # everything else in the tick keeps its own cadence. A short interval in
+    # settings.ini (tests use 1 s) simply means one slice per tick.
+    _v6_int=2
+    case "${watchdog_interval:-30}" in
+        ''|*[!0-9]*) : ;;
+        *) [ "$watchdog_interval" -lt "$_v6_int" ] && _v6_int="$watchdog_interval" ;;
+    esac
+    _waited=0
     while :; do
-        sleep "$watchdog_interval"
+        sleep "$_v6_int"
+        _waited=$((_waited + _v6_int))
+        if [ ! -f "$state_file" ] && v6_drift; then
+            PISING_QUIET=1 "${bin_dir}/pi.iptables" v6enforce >/dev/null 2>&1
+        fi
+        [ "$_waited" -ge "$watchdog_interval" ] || continue
+        _waited=0
         if [ -n "$_own" ]; then
             _now="$(cksum "$0" 2>/dev/null)"
             if [ -n "$_now" ] && [ "$_now" != "$_own" ]; then
