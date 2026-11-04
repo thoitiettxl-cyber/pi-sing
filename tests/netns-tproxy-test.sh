@@ -180,9 +180,25 @@ ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
     ok "IPv6 stack disabled on the interface inside the namespace" || bad "disable_ipv6 was not set"
 [ "$(ns cat /proc/sys/net/ipv6/conf/lo/disable_ipv6 2>/dev/null)" = "0" ] &&
     ok "lo is left alone, ::1 keeps working" || bad "lo lost IPv6 too"
+[ "$(ns cat /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null)" = "1" ] &&
+    ok "the new-interface template is off too" || bad "conf/default/disable_ipv6 was not set"
+# netd re-enables IPv6 on every network it brings up, and an interface created
+# after `on` inherits the template (measured on the device: WiFi came up after
+# the boot start, wlan0 got disable_ipv6=0 back, netd's resolver list held
+# fe80::1%wlan0 and names left for the LAN router).
+ns ip link add vns9 type dummy 2>/dev/null
+ns ip link set vns9 up 2>/dev/null
+[ "$(ns cat /proc/sys/net/ipv6/conf/vns9/disable_ipv6 2>/dev/null)" = "1" ] &&
+    ok "an interface created after \`on\` comes up with IPv6 off" || bad "a new interface came up with IPv6 on"
+ns sh -c 'echo 0 > /proc/sys/net/ipv6/conf/vns0/disable_ipv6' 2>/dev/null
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" v6enforce >/dev/null 2>&1
+[ "$(ns cat /proc/sys/net/ipv6/conf/vns0/disable_ipv6 2>/dev/null)" = "1" ] &&
+    ok "\`v6enforce\` switches IPv6 off again after netd turned it on" || bad "enforce left IPv6 on"
 ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" off >/dev/null 2>&1
 [ "$(ns cat /proc/sys/net/ipv6/conf/vns0/disable_ipv6 2>/dev/null)" = "0" ] &&
     ok "\`off\` restored the previous sysctl values" || bad "disable_ipv6 was not restored"
+[ "$(ns cat /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null)" = "0" ] &&
+    ok "\`off\` restored the new-interface template" || bad "conf/default/disable_ipv6 was not restored"
 sed -i 's/^ipv6=.*/ipv6="block"/' "$DATA/settings.ini"
 ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
 

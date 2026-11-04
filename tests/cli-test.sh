@@ -213,6 +213,39 @@ for _p in $(pgrep -f "$DATA/bin/pi-sing watchdog" 2>/dev/null); do kill -9 "$_p"
 sed -i 's/^watchdog_interval=.*/watchdog_interval=30/' "$DATA/settings.ini"
 
 echo "== a process that only mentions the core path is not the core"
+echo "== a name lookup that fails while 1.1.1.1 works turns the card orange"
+# Measured on the device: sing-box's DoH server had a detour through the tunnel,
+# the tunnel came from the old uplink, and after WiFi connected every lookup was
+# SERVFAIL while an IP literal still worked — apps then resolved through netd and
+# the leak test answered from the ISP's resolvers. The rules must stay (that is a
+# DNS problem, not a leak to close), but the card must not claim green.
+reset
+cat > "${TMP}/fakebin/curl" <<EOF
+#!/bin/sh
+case " \$* " in
+    *gstatic*) exit 6 ;;   # a name: the resolver is down
+esac
+exit 0                     # every IP-literal probe passes
+EOF
+chmod 755 "${TMP}/fakebin/curl"
+sed -i 's/^selftest=.*/selftest=1/' "$DATA/settings.ini"
+LEVEL=info write_config '"ui"'
+cli start >/dev/null 2>&1
+[ -f "$DATA/run/dns.failed" ] && ok "the failing name lookup is recorded" || bad "dns.failed was not written"
+grep -q 'DNS failing' "$MOD/module.prop" && ok "the card says DNS is failing, not green" ||
+    bad "the card still claims green ($(grep '^description' "$MOD/module.prop"))"
+[ -f "$TMP/rules.on" ] && ok "the rules stay installed (fail closed, no leak to open)" ||
+    bad "a DNS failure dropped the rules"
+printf '#!/bin/sh\nexit 0\n' > "${TMP}/fakebin/curl"   # resolver answers again
+cli stop >/dev/null 2>&1
+cli start >/dev/null 2>&1
+[ -f "$DATA/run/dns.failed" ] && bad "a working resolver did not clear the flag" ||
+    ok "a working resolver clears the flag"
+grep -q 'Running' "$MOD/module.prop" && ok "the card is green again" || bad "the card did not go back to green"
+rm -f "${TMP}/fakebin/curl"
+sed -i 's/^selftest=.*/selftest=0/' "$DATA/settings.ini"
+
+echo "== a process that only mentions the core path is not the core"
 # Measured on the device: the container shares the phone's PID namespace, so a
 # shell whose command line contained bin_path looked like a running core and
 # `stop` killed it (the agent's own shell got SIGKILLed). Only an argv token

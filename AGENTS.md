@@ -45,7 +45,7 @@ module/uninstall.sh           stop, drop rules, delete /data/adb/pi-sing
 module/META-INF/.../update-binary   unmodified Magisk module_installer.sh (GPL-3.0)
 module/payload/settings.ini   the only knobs; sourced by both scripts
 module/payload/bin/pi-sing    CLI: start|stop|restart|status|log|iptables|update-core|watchdog
-module/payload/bin/pi.iptables  rules: on|off|renew|status
+module/payload/bin/pi.iptables  rules: on|off|renew|v6enforce|status
 module/payload/bin/sing-box   NEVER shipped and not committed; update-core installs
                               the core on the phone (tools/fetch-sing-box.sh is for
                               host tests / a manual push only)
@@ -58,16 +58,20 @@ tools/fetch-sing-box.sh       pinned release + sha256
 tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip (module only,
                               the core is never bundled; --full is refused)
 tests/smoke-check.sh          sh -n on every script + sing-box check on both configs
-tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (23 assertions:
+tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (27 assertions:
                               TPROXY/DNS/per-app, hotspot ingress captured unless
                               it matches the uplink, PISING_DRY_RUN prints
                               without installing, ipv6=disable sets and restores
-                              sysctls)
+                              sysctls, an interface created after `on` inherits the
+                              `default` template, `v6enforce` undoes what netd
+                              turns back on)
 tests/cli-test.sh             host, stub core: dashboard resolution (relative /
                               object / absolute), core_log_level, 🟢/🔴 description,
                               log split/rotation, watchdog vs a user stop, a decoy
                               process that mentions bin_path is not the core,
-                              services[].dashboard left alone (30)
+                              services[].dashboard left alone, a failing name lookup
+                              flagging run/dns.failed and the 🟠 DNS card while the
+                              rules stay (35)
 tests/action-test.sh          host: fail-closed state (rules stay, core dies) and
                               the action button's one-press OFF, the 🟠 card, the
                               watchdog not repainting 🟢 over it, a stale verdict not
@@ -185,10 +189,10 @@ Host (this container; kernel has xt_TPROXY, `ip netns` works):
 
 ```
 SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
-SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 23/23 expected
+SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 27/27 expected
 tests/update-core-test.sh                           # 44/44 expected, no device
 tests/installer-test.sh                             # 67/67 expected, no device
-tests/cli-test.sh                                   # 30/30 expected, no device
+tests/cli-test.sh                                   # 35/35 expected, no device
 tests/action-test.sh                                # 32/32 expected, no device
 tools/build.sh                                      # smoke + the module zip (no core)
 ```
@@ -332,6 +336,46 @@ A useful device check set (all must hold):
   level is written into config.json from `core_log_level` (default `warn`). One
   INFO line per connection was 4 633 B/min on the device; at warn an idle core
   writes nothing.
+- **netd turns IPv6 back on, so `ipv6=disable` cannot be a one-shot sysctl.**
+  Measured 2026-11-04: the boot start logged `IPv6 stack off on 29 interface(s)`,
+  then WiFi connected, netd brought `wlan0` up with `disable_ipv6=0`, droidspaces
+  created `ds-br0` (also 0), netd's resolver list held `fe80::1%wlan0` and the
+  names left for the LAN router — the leak the mode exists to prevent. Two things
+  fix it: the `default` template is written too (an interface created later
+  inherits it), and the watchdog calls `pi.iptables v6enforce` every tick, which
+  re-applies only what drifted (a few file reads, one log line when it acts).
+  It runs forever, so it has to be cheap: one `read` per file instead of `cat`
+  (measured on the device: 400 ms -> 35 ms per tick, 128 ms when it has to fix
+  something), and never `read ... || continue` — a `/proc/sys` value has no
+  trailing newline, so dash returns 1 there while still setting the variable
+  (measured: every interface read "1" and nothing was fixed).
+  `all/disable_ipv6` must still stay untouched: writing it cascades to `lo` and
+  kills `::1` (measured).
+- **A resolver that dies while the tunnel still works is a leak, not a tunnel
+  failure.** The 2026-11-04 leak test ran at the exact second WiFi became the
+  default network: `sing-box.log` shows `dns: lookup failed ... SERVFAIL` for
+  every name while `https://1.1.1.1/cdn-cgi/trace` still answered, and the test
+  then reported the ISP's resolvers because the app resolved through netd (over
+  `fe80::1%wlan0`, which IPv6-off no longer leaves reachable). So the selftest and
+  the watchdog probe a **name** (`www.gstatic.com/generate_204`), not only an IP
+  literal: literal ok + name failing writes `run/dns.failed`, the card goes 🟠
+  `DNS failing - names leak` and the rules stay (closing the tunnel would only
+  move the leak).
+  The `detour` of a DoH server is **not** the cause: A/B measured the same day
+  with `remote_dns` = DoH `8.8.8.8` both with `detour: Soul_🌐` (through the
+  WireGuard endpoint) and without it — the leak test answered
+  `Google 172.253.0.x` and `Google 74.114.31.x` respectively, i.e. no ISP
+  resolver either way, and `0` conntrack entries existed for the ISP resolvers the
+  failing test had named. Keep the user's `detour`; only the detection above is
+  this module's business.
+- **The watchdog is started by `service.sh` only, so it re-execs itself when the
+  script changes.** Measured 2026-11-04: a new `pi-sing` was pushed to
+  `/data/adb/pi-sing/bin` and `pi-sing restart` did not touch the loop that had
+  been running since boot, so the new per-tick work never happened until the loop
+  was restarted by hand. `do_watchdog` compares `cksum "$0"` once per interval
+  and `exec`s itself on a change (same pid). Killing a stale loop by hand needs
+  the pid plus `/proc/<pid>/cmdline`, never `pgrep -f "pi-sing watchdog"` (toybox
+  matches either word and lists `sing-box`).
 - **An old `settings.ini` has no `core_log_level`**: resolve the default in a
   variable (`_lvl="${core_log_level:-warn}"`) before using it under `set -u`, or
   awk never runs and the config keeps `info` (measured on the first device

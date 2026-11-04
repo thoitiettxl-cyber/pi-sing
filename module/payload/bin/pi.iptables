@@ -427,27 +427,92 @@ ipv6_mode() {
 # The previous sysctl values are saved so `off` can put them back.
 v6_stack_saved="${run_dir}/v6.stack.saved"
 
+
+# Record one interface's current IPv6 sysctls, once, so `off` can put them back
+# even for an interface that only appeared after this script ran.
+v6_record() {  # $1 = interface name, or `default` for the template
+    [ -f "$v6_stack_saved" ] || return 0
+    grep -q "^$1 " "$v6_stack_saved" 2>/dev/null && return 0
+    _d="/proc/sys/net/ipv6/conf/$1"
+    [ -f "${_d}/disable_ipv6" ] || return 0
+    printf '%s %s %s %s\n' "$1" \
+        "$(cat "${_d}/disable_ipv6" 2>/dev/null)" \
+        "$(cat "${_d}/accept_ra" 2>/dev/null)" \
+        "$(cat "${_d}/autoconf" 2>/dev/null)" >> "$v6_stack_saved"
+    return 0
+}
+
+v6_off() {  # $1 = interface name, or `default` for the template
+    _d="/proc/sys/net/ipv6/conf/$1"
+    sysctl_write "${_d}/disable_ipv6" 1
+    sysctl_write "${_d}/accept_ra" 0
+    sysctl_write "${_d}/autoconf" 0
+    return 0
+}
+
 apply_v6_disable() {
     : > "$v6_stack_saved" 2>/dev/null
+    # The `default` template first: an interface created after this point (netd
+    # brings wlan0 up again, droidspaces creates ds-br0) inherits it, and such an
+    # interface came up with disable_ipv6=0 on the device (measured 2026-11-04:
+    # WiFi connected after the boot start, netd re-enabled IPv6, netd's resolver
+    # list held fe80::1%wlan0 and names went out to the LAN router).
+    # `all` stays untouched: writing it cascades to every interface, lo included,
+    # and kills ::1 (measured: lo/disable_ipv6 became 1 even though lo was
+    # skipped).
+    v6_record default
+    v6_off default
     _n=0
     for _d in /proc/sys/net/ipv6/conf/*; do
         _if="${_d##*/}"
-        # `all` and `default` are templates: writing them cascades to every
-        # interface, lo included, which kills ::1 (measured: lo/disable_ipv6
-        # became 1 even though lo was skipped). Only real interfaces are touched.
         case "$_if" in all|default|lo) continue ;; esac
         [ -f "${_d}/disable_ipv6" ] || continue
-        printf '%s %s %s %s\n' "$_if" \
-            "$(cat "${_d}/disable_ipv6" 2>/dev/null)" \
-            "$(cat "${_d}/accept_ra" 2>/dev/null)" \
-            "$(cat "${_d}/autoconf" 2>/dev/null)" >> "$v6_stack_saved"
-        sysctl_write "${_d}/disable_ipv6" 1
-        sysctl_write "${_d}/accept_ra" 0
-        sysctl_write "${_d}/autoconf" 0
+        v6_record "$_if"
+        v6_off "$_if"
         _n=$((_n + 1))
     done
     [ "$_n" -gt 0 ] || { log Warn "ipv6=disable: no /proc/sys/net/ipv6/conf entry to write"; return 0; }
-    log Info "ipv6=disable: IPv6 stack off on ${_n} interface(s), lo kept"
+    log Info "ipv6=disable: IPv6 stack off on ${_n} interface(s) + the new-interface template, lo kept"
+    return 0
+}
+
+# netd turns IPv6 back on for a network it brings up, and an interface created
+# after `on` inherits whatever the `default` template says at that moment. The
+# watchdog calls this every tick (a few file reads) so `ipv6=disable` keeps its
+# promise until `off`; the log line appears only when something was flipped.
+enforce_v6_disable() {
+    [ "$(ipv6_mode)" = "disable" ] || return 0
+    [ -f "$v6_stack_saved" ] || return 0
+    _changed=""
+    _n=0
+    # One `read` per file, no `cat`, and no write unless a value actually
+    # drifted: this runs every watchdog tick forever, and the cat-based version
+    # cost ~400 ms per pass on the device (34 interfaces x 3 forks).
+    # `read` must not be used with `|| continue`: a /proc/sys value has no
+    # trailing newline, so dash returns 1 there even though the variable is set
+    # (measured on the host and inside the test namespace).
+    _dft=""
+    read -r _dft < /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null
+    if [ "${_dft:-1}" != "1" ]; then
+        v6_off default
+        _changed="default"
+        _n=1
+    fi
+    for _d in /proc/sys/net/ipv6/conf/*; do
+        _if="${_d##*/}"
+        case "$_if" in all|default|lo) continue ;; esac
+        [ -f "${_d}/disable_ipv6" ] || continue
+        _v=""
+        read -r _v < "${_d}/disable_ipv6" 2>/dev/null
+        [ "${_v:-1}" = "1" ] && continue
+        v6_record "$_if"
+        v6_off "$_if"
+        _changed="${_changed:+${_changed} }${_if}"
+        _n=$((_n + 1))
+    done
+    if [ "$_n" -gt 0 ]; then
+        log Info "ipv6=disable: switched IPv6 off again on ${_n} (${_changed}) - netd re-enables it on a new network"
+    fi
     return 0
 }
 
@@ -508,7 +573,23 @@ do_status() {
     i4 -t mangle -S OUTPUT 2>/dev/null | grep -F PISING || printf '(v4 output none)\n'
     i6 -t mangle -S PREROUTING 2>/dev/null | grep -F PISING || printf '(v6 none)\n'
     printf '== ipv6 mode: %s\n' "$(ipv6_mode)"
-    [ -f "$v6_stack_saved" ] && printf '== ipv6 stack: off on %s interface(s)\n' "$(wc -l < "$v6_stack_saved" | tr -d ' ')"
+    if [ -f "$v6_stack_saved" ]; then
+        _off=0
+        _drift=""
+        for _d in /proc/sys/net/ipv6/conf/*; do
+            _if="${_d##*/}"
+            case "$_if" in all|default|lo) continue ;; esac
+            [ -f "${_d}/disable_ipv6" ] || continue
+            if [ "$(cat "${_d}/disable_ipv6" 2>/dev/null)" = "1" ]; then
+                _off=$((_off + 1))
+            else
+                _drift="${_drift:+${_drift} }${_if}"
+            fi
+        done
+        printf '== ipv6 stack: off on %s interface(s), template %s\n' "$_off" \
+            "$(cat /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null)"
+        [ -n "$_drift" ] && printf '== ipv6 on again (netd?): %s\n' "$_drift"
+    fi
     printf '== PISING_LOCAL counters\n'
     i4 -t mangle -L "$c_local" -n -v 2>/dev/null || printf '(none)\n'
     return 0
@@ -517,9 +598,10 @@ do_status() {
 case "${1:-}" in
     on|enable|renew) do_on ;;
     off|disable)     do_off ;;
+    v6enforce)       enforce_v6_disable ;;
     status)          do_status ;;
     *)
-        printf 'usage: %s {on|off|renew|status}\n' "$0" >&2
+        printf 'usage: %s {on|off|renew|v6enforce|status}\n' "$0" >&2
         exit 1
         ;;
 esac

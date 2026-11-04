@@ -29,6 +29,12 @@ state_file="${run_dir}/stopped"
 # instead of turning green at the next watchdog tick. Cleared by a start that
 # passes and by `stop`.
 selftest_failed_file="${run_dir}/selftest.failed"
+# Written when a name lookup fails while the direct path still works: the rules
+# and the core are fine, but sing-box's own resolver is not, so every app falls
+# back to netd's resolvers and its names leave the tunnel (measured 2026-11-04:
+# WiFi came up after the boot start, sing-box's DoH detour died, `dns: lookup
+# failed ... SERVFAIL` and the leak test answered from the ISP's resolvers).
+dns_failed_file="${run_dir}/dns.failed"
 # log_dir comes from settings.ini; defaulted here for a settings file written by
 # v1.3.0, which has no log_dir line.
 log_dir="${log_dir:-${run_dir}/log}"
@@ -158,6 +164,8 @@ update_state() {
     if [ -n "${_p:-}" ] && rules_hooked; then
         if [ -f "$selftest_failed_file" ]; then
             update_desc "🟠 Tunnel down - tap to stop"
+        elif [ -f "$dns_failed_file" ]; then
+            update_desc "🟠 DNS failing - names leak"
         else
             update_desc "🟢 Running (pid ${_p})"
         fi
@@ -231,6 +239,43 @@ http_probe() {  # $1 = url, $2 = optional command prefix ("busybox setuidgid 0:3
     $_wrap $_cmd >/dev/null 2>&1
 }
 
+# A name, not an IP literal: this is the only probe that needs the DNS path. The
+# rules hijack port 53, so a name lookup goes to sing-box's resolver, and when
+# that resolver dies (a DoH server whose detour is a dead tunnel, measured on the
+# device) it answers SERVFAIL and the app resolves through netd instead.
+dns_probe() {
+    http_probe https://www.gstatic.com/generate_204
+}
+
+# Same test as dns_probe, but only reports a failure when the direct path works:
+# a phone without internet is not a leaking DNS. Sets run/dns.failed, which
+# update_state turns into the orange card, and clears it once names resolve
+# again.
+check_dns_health() {
+    if dns_probe; then
+        if [ -f "$dns_failed_file" ]; then
+            rm -f "$dns_failed_file"
+            log Info "dns path ok again"
+            update_state
+        fi
+        return 0
+    fi
+    _bb="$(find_busybox)"
+    _gid="$(cat "${run_dir}/core.gid" 2>/dev/null)"
+    if [ -n "${_gid:-}" ] && [ -n "${_bb:-}" ]; then
+        http_probe https://1.1.1.1/cdn-cgi/trace "$_bb setuidgid 0:$_gid" || return 0
+    else
+        http_probe https://1.1.1.1/cdn-cgi/trace || return 0
+    fi
+    if [ ! -f "$dns_failed_file" ]; then
+        : > "$dns_failed_file"
+        log Warn "name lookup failed while 1.1.1.1 works: sing-box's resolver is down and apps resolve through netd (DNS leak), rules stay"
+        log Warn "check the dns section of ${config_path} (a server whose detour is a dead tunnel answers SERVFAIL)"
+        update_state
+    fi
+    return 1
+}
+
 # Two probes: one from a socket exempted by the rules (direct) and one that the
 # rules must capture (proxied). If direct works but proxied does not, the tunnel
 # is down and the rules stay (fail closed, no leak) — the phone is offline until
@@ -262,6 +307,18 @@ selftest() {
     if http_probe https://1.1.1.1/cdn-cgi/trace; then
         rm -f "$selftest_failed_file"
         log Info "selftest: proxied path ok"
+        # An IP literal needs no DNS. Ask for a name as well: if that fails while
+        # the literal works, the core's own resolver is broken and the apps will
+        # resolve through netd instead (the leak this flag exists for). The rules
+        # stay installed: this is a DNS problem, not a tunnel that must be closed.
+        if dns_probe; then
+            rm -f "$dns_failed_file"
+            log Info "selftest: dns path ok"
+        else
+            : > "$dns_failed_file"
+            log Warn "selftest: name lookup failed while 1.1.1.1 works - apps fall back to the phone's own resolvers (DNS leak); rules kept"
+        fi
+        update_state
         return 0
     fi
     if [ -n "$_direct" ]; then
@@ -415,7 +472,7 @@ do_start() {
     fi
     # A fresh attempt gets a fresh verdict; the already-running branch above keeps
     # the old one, because nothing is probed again there.
-    rm -f "$selftest_failed_file"
+    rm -f "$selftest_failed_file" "$dns_failed_file"
     sync_config || return 1
     prepare_core_log
     if ! check_config; then
@@ -476,7 +533,7 @@ do_stop() {
         log Info "sing-box is not running"
     fi
     rm -f "$pid_file" "${run_dir}/core.gid"
-    rm -f "$selftest_failed_file"
+    rm -f "$selftest_failed_file" "$dns_failed_file"
     update_state
     return 0
 }
@@ -511,6 +568,8 @@ do_status() {
     else
         printf 'iptables   : not hooked\n'
     fi
+    [ -f "$dns_failed_file" ] &&
+        printf 'dns        : lookup failing, apps fall back to the phone resolvers (leak)\n'
     printf 'logs       : %s/{module,sing-box}.log\n' "$log_dir"
     return 0
 }
@@ -729,11 +788,30 @@ do_update_core() {
 do_watchdog() {
     [ "$watchdog" = "1" ] || { log Info "watchdog disabled"; return 0; }
     log Info "watchdog started (${watchdog_interval}s)"
+    # The boot service is the only place that starts this loop, so a module
+    # update (a new script, an update-core, a reinstall) would leave the old code
+    # running until the next reboot. Measured 2026-11-04: the IPv6 re-apply only
+    # reached the phone after the loop was restarted by hand. `cksum` once per
+    # interval is cheap, and `exec` keeps the same pid.
+    _own=""
+    command -v cksum >/dev/null 2>&1 && _own="$(cksum "$0" 2>/dev/null)"
     _iface=""
     _nocore=0
     _last=""
     while :; do
         sleep "$watchdog_interval"
+        if [ -n "$_own" ]; then
+            _now="$(cksum "$0" 2>/dev/null)"
+            if [ -n "$_now" ] && [ "$_now" != "$_own" ]; then
+                log Info "pi-sing changed on disk, re-exec so the loop runs the new code"
+                exec "$0" watchdog
+            fi
+        fi
+        # Cheap: a few file reads, and a log line only when something drifted.
+        # netd re-enables IPv6 on every network it brings up, so `ipv6=disable`
+        # has to be re-applied while the rules are installed.
+        PISING_QUIET=1 "${bin_dir}/pi.iptables" v6enforce >/dev/null 2>&1
+        _tick=$(( ${_tick:-0} + 1 ))
         if [ -f "$state_file" ]; then
             # A user stop (action button / `pi-sing stop`): stay down. A crash
             # has no flag, so it is still restarted.
@@ -771,8 +849,16 @@ do_watchdog() {
             if [ -n "$_iface" ]; then
                 log Info "default interface ${_iface} -> ${_cur}, renewing rules"
                 PISING_QUIET=1 "${bin_dir}/pi.iptables" renew
+                # A network change is when the core's own resolver breaks: the
+                # tunnel came from the old uplink, and the leak test on this
+                # phone failed exactly here (SERVFAIL, then the ISP's resolvers).
+                check_dns_health
             fi
             _iface="$_cur"
+        elif [ -f "$dns_failed_file" ] && [ $(( _tick % 5 )) -eq 0 ]; then
+            # Still flagged: retry now and then instead of on every tick, so a
+            # broken resolver does not turn into a probe every 30 s.
+            check_dns_health
         fi
     done
 }
