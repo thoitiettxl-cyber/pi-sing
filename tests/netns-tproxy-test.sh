@@ -147,6 +147,24 @@ ns iptables -t mangle -S PISING_LOCAL | grep -q -- '0.0.0.0/0.*MARK or 0x200000'
 sed -i 's/^proxy_mode=.*/proxy_mode="blacklist"/' "$DATA/settings.ini"
 ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
 
+echo "== hotspot ingress: proxied, unless it is the uplink"
+ns ip link add wlan2 type dummy 2>/dev/null
+ns ip link set wlan2 up 2>/dev/null
+printf 'allow wlan2\n' >> "$DATA/lists/ap.list.cfg"
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+ns iptables -t mangle -S PISING_EXT | grep -q -- '-i wlan2 -p tcp -j TPROXY' &&
+    ok "hotspot interface wlan2 is captured" || bad "wlan2 rule missing"
+ns iptables -t mangle -S PISING_EXT | grep -q -- '-i wlan2 -p udp -j TPROXY' &&
+    ok "hotspot interface wlan2 is captured for udp too" || bad "wlan2 udp rule missing"
+# Same interface as the uplink: the entry must be dropped again.
+ns env PISING_DIR="$DATA" PISING_UPLINK_IF=wlan2 "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+ns iptables -t mangle -S PISING_EXT | grep -q -- '-i wlan2' &&
+    bad "the uplink interface was captured (traffic would loop)" ||
+    ok "an entry matching the default-route interface is skipped"
+grep -q '^wlan2$' "$DATA/run/ap.list" && bad "wlan2 kept in run/ap.list" || ok "run/ap.list dropped the uplink"
+sed -i '/^allow wlan2$/d' "$DATA/lists/ap.list.cfg"
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+
 echo "== dry run prints the commands and touches nothing"
 _dry_before="$(ns iptables -t mangle -S 2>/dev/null | md5sum)"
 ns env PISING_DIR="$DATA" PISING_DRY_RUN=1 "$DATA/bin/pi.iptables" on >"${TMP}/dry.out" 2>&1

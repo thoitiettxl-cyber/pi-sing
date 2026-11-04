@@ -309,6 +309,7 @@ unchanged.
 | `quic` | `disable` | reject UDP 443/80 so apps fall back to TCP |
 | `proxy_mode` | `blacklist` | `blacklist` = proxy everything except listed apps; `whitelist` = only listed apps |
 | `bypass_interfaces` | `ds-br+ ds-v+ vgate0 dummy0` | incoming interfaces that are never touched (Droidspaces bridges, VM gateway) |
+| `ap.list.cfg` | `ap+ swlan+ wlan1 wlan2 rndis+ ncm+ eth+` | interfaces whose *ingress* is proxied (hotspot/tether). An entry matching the interface that carries the default route is skipped at start, so the uplink can never be captured; `PISING_UPLINK_IF=<iface>` overrides the detection |
 | `ignore_interfaces` | empty | output interfaces that are never proxied |
 | `core_user`/`core_group`/`core_gid` | `root`/`net_admin`/`3005` | the core runs as this uid:gid so its own traffic can be bypassed by gid |
 | `core_log_level` | `warn` | level written into `config.json` at start; `config`/empty leaves the file in charge. `warn` keeps one line per connection out of the log |

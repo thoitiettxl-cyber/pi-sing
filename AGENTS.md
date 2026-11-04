@@ -58,9 +58,11 @@ tools/fetch-sing-box.sh       pinned release + sha256
 tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip (module only,
                               the core is never bundled; --full is refused)
 tests/smoke-check.sh          sh -n on every script + sing-box check on both configs
-tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (18 assertions:
-                              TPROXY/DNS/per-app, PISING_DRY_RUN prints without
-                              installing, ipv6=disable sets and restores sysctls)
+tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (23 assertions:
+                              TPROXY/DNS/per-app, hotspot ingress captured unless
+                              it matches the uplink, PISING_DRY_RUN prints
+                              without installing, ipv6=disable sets and restores
+                              sysctls)
 tests/cli-test.sh             host, stub core: dashboard resolution (relative /
                               object / absolute), core_log_level, 🟢/🔴 description,
                               log split/rotation, watchdog vs a user stop, a decoy
@@ -169,6 +171,13 @@ Why it must stay this way (each measured — see README):
   phone on its own. `tests/netns-tproxy-test.sh` asserts both directions.
 - `-D` needs the full match spec (`-m socket --transparent`), or `PISING_DIVERT`
   survives `stop`.
+- **The hotspot interface is `wlan2` on this OPPO** (measured: `10.155.19.27/24`
+  while the uplink was `rmnet_data2`), so `ap.list.cfg` ships `wlan1`/`wlan2`
+  next to `ap+`/`swlan+`/`rndis+`/`ncm+`/`eth+`. `read_ap_list` drops any entry
+  that matches the interface carrying the default route: capturing the uplink's
+  ingress proxies traffic that merely passes through (and the dev container's own
+  path). `PISING_UPLINK_IF=<iface>` overrides the detection for tests or a ROM
+  where `ip route get` answers from the wrong table.
 
 ## Testing
 
@@ -176,7 +185,7 @@ Host (this container; kernel has xt_TPROXY, `ip netns` works):
 
 ```
 SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
-SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 14/14 expected
+SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 23/23 expected
 tests/update-core-test.sh                           # 38/38 expected, no device
 tests/installer-test.sh                             # 66/66 expected, no device
 tests/cli-test.sh                                   # 29/29 expected, no device

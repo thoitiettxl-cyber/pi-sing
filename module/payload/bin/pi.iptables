@@ -159,11 +159,39 @@ read_uid_list() {
     return 0
 }
 
+# Interface carrying the default route: the uplink. Its *ingress* must never be
+# captured, or traffic that merely passes through gets proxied (and on the
+# dev/agent container that path is the host's own network).
+uplink_interface() {
+    # PISING_UPLINK_IF overrides the detection: `ip route get` answers from the
+    # fwmark-free main table, which on Android is not necessarily the network
+    # that carries traffic, and the tests need a deterministic answer.
+    if [ -n "${PISING_UPLINK_IF:-}" ]; then
+        printf '%s\n' "$PISING_UPLINK_IF"
+        return 0
+    fi
+    for _gw in 1.1.1.1 8.8.8.8; do
+        _u="$(ip route get "$_gw" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+        [ -n "${_u:-}" ] && { printf '%s\n' "$_u"; return 0; }
+    done
+    printf '%s\n' "$(ip -4 -o route show default 2>/dev/null | awk '{ print $NF; exit }' | sed 's/.*dev //')"
+}
+
 read_ap_list() {
     : > "${run_dir}/ap.list" 2>/dev/null
     cfg="${list_dir}/ap.list.cfg"
     [ -f "$cfg" ] || return 0
-    awk '/^[ \t]*allow[ \t]+/ { print $2 }' "$cfg" >> "${run_dir}/ap.list"
+    _uplink="$(uplink_interface)"
+    awk -v uplink="${_uplink:-}" '
+        /^[ \t]*allow[ \t]+/ {
+            ap = $2
+            base = ap
+            sub(/\+$/, "", base)
+            # wlan2 is the hotspot on some phones and the uplink on others: the
+            # pattern is kept, but it is dropped when it is the current uplink.
+            if (uplink != "" && index(uplink, base) == 1) next
+            print ap
+        }' "$cfg" >> "${run_dir}/ap.list"
     return 0
 }
 
