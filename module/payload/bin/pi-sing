@@ -619,7 +619,13 @@ do_update_core() {
         log Error "update: cannot fetch ${UPDATE_API} (no network?)"
         return 1
     fi
-    _tag="$(sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "${_upd}/release.json" | head -n 1)"
+    # GitHub serves the release as one line of compact JSON (285 KB measured), so
+    # nothing may be matched by line layout, and toybox sed/awk give up on a line
+    # that long. Join everything into one line and split again at every object:
+    # one short line per JSON object, whatever shape the API used. Nothing here
+    # pins a version: the tag always comes from the API response.
+    tr -d '\n' < "${_upd}/release.json" | tr '{' '\n' > "${_upd}/release.split"
+    _tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${_upd}/release.split" | head -n 1)"
     if [ -z "${_tag:-}" ]; then
         log Error "update: no tag_name in the API response (rate limited?), see ${_upd}/release.json"
         return 1
@@ -634,20 +640,20 @@ do_update_core() {
         return 0
     fi
 
-    # The digest sits in the same asset object as the name; scan forward until
-    # the next asset starts so another asset's digest is never picked up.
-    _want="$(awk -v name="\"name\": \"${_tar}\"" '
-        index($0, name) { on = 1; next }
-        on && /"name":[[:space:]]*"/ { exit }
-        on && /"digest":[[:space:]]*"sha256:/ {
-            sub(/.*"digest":[[:space:]]*"sha256:/, "")
-            sub(/".*/, "")
-            print
-            exit
-        }' "${_upd}/release.json")"
+    # The digest sits in the same asset object as the name, and the split above
+    # puts one object per line, so the name and its digest are on the same line:
+    # take the digest from the line that carries this asset's name.
+    _want="$(grep -F "\"${_tar}\"" "${_upd}/release.split" 2>/dev/null |
+        sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"sha256:\([0-9a-f][0-9a-f]*\)".*/\1/p' |
+        head -n 1)"
+    # No digest is not an error: GitHub only publishes `digest` for assets
+    # uploaded after it introduced the field, and this project's tarballs do not
+    # have one (`sing-box-1.14.4-android-arm64.tar.gz` measured: the APK assets
+    # carry a digest, the tarball has no such key). The download is still pinned
+    # to the release URL over TLS, must extract exactly the expected binary, must
+    # report the release tag, and must pass `check` against the live config.
     if [ -z "${_want:-}" ]; then
-        log Error "update: ${_tag} publishes no sha256 digest for ${_tar}, refusing to install it"
-        return 1
+        log Warn "update: ${_tag} publishes no sha256 digest for ${_tar}; verifying by version and check only"
     fi
 
     log Info "update: ${_cur:-unknown} -> ${_ver}, downloading ${_tar}"
@@ -657,13 +663,15 @@ do_update_core() {
         log Error "update: download failed: ${UPDATE_DL}/${_tag}/${_tar}"
         return 1
     fi
-    _got="$(sha256_of "${_upd}/${_tar}")" ||
-        { log Error "update: no sha256sum/shasum on this device"; return 1; }
-    if [ "$_got" != "$_want" ]; then
-        log Error "update: sha256 mismatch for ${_tar} (want ${_want}, got ${_got})"
-        return 1
+    if [ -n "${_want:-}" ]; then
+        _got="$(sha256_of "${_upd}/${_tar}")" ||
+            { log Error "update: no sha256sum/shasum on this device"; return 1; }
+        if [ "$_got" != "$_want" ]; then
+            log Error "update: sha256 mismatch for ${_tar} (want ${_want}, got ${_got})"
+            return 1
+        fi
+        log Info "update: sha256 ok (${_want})"
     fi
-    log Info "update: sha256 ok (${_want})"
 
     ( cd "$_upd" && tar -xzf "$_tar" ) >> "$module_log" 2>&1 ||
         { log Error "update: cannot extract ${_tar}"; return 1; }

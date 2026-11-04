@@ -77,7 +77,9 @@ tests/installer-test.sh       customize.sh on the host: fresh install, system/bi
                               getevent (wall-clock window, drained queue), thin zip
                               with/without a core (67)
 tests/update-core-test.sh     update-core against a fake release API served locally:
-                              digest, swap + restart, no-op, refusal, rollback, first
+                              digest, a compact one-line payload (what GitHub
+                              serves), a release with no digest at all, swap +
+                              restart, no-op, refusal, rollback, first
                               core on a thin install (no previous binary to back up),
                               update_mirror rewriting only github URLs (38)
 ```
@@ -276,7 +278,8 @@ A useful device check set (all must hold):
 2. `SINGBOX_BIN=... tools/build.sh` → `dist/Pi-Sing-<version>.zip` + sha256,
    module only. Nothing is pinned to a core release: the zip has none, and
    `update-core` follows GitHub's latest (the digest comes from the same API
-   response). A core in `module/payload/bin/` (from `tools/fetch-sing-box.sh`,
+   response when the asset has one; sing-box's tarballs do not, so that path
+   warns and verifies by tag + `check`). A core in `module/payload/bin/` (from `tools/fetch-sing-box.sh`,
    needed by the host tests) is not copied into the zip.
 3. `SINGBOX_BIN=... tests/netns-tproxy-test.sh` and the device check set above.
    `tools/build.sh` already runs smoke + cli-test + action-test + installer-test.

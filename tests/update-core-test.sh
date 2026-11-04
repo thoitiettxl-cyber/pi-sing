@@ -129,6 +129,11 @@ publish() {  # $1 = tag (9.9.9), $2 = release json name, $3 = core kind, $4 = di
         "sing-box-${_ver}-android-arm64"
     [ -n "$_dig" ] || _dig="$(sha256sum "${DOC}/v${_ver}/sing-box-${_ver}-android-arm64.tar.gz" |
         awk '{ print $1 }')"
+    if [ "${5:-}" = "no-digest" ]; then
+        _digest_line=""
+    else
+        _digest_line="\"digest\": \"sha256:${_dig}\","
+    fi
     cat > "${DOC}/${_name}.json" <<EOF
 {
   "tag_name": "v${_ver}",
@@ -136,7 +141,7 @@ publish() {  # $1 = tag (9.9.9), $2 = release json name, $3 = core kind, $4 = di
     {
       "name": "sing-box-${_ver}-android-arm64.tar.gz",
       "state": "uploaded",
-      "digest": "sha256:${_dig}",
+      ${_digest_line}
       "browser_download_url": "http://127.0.0.1/v${_ver}/sing-box-${_ver}-android-arm64.tar.gz"
     }
   ]
@@ -299,6 +304,28 @@ grep -qF "https://api.github.com/repos/SagerNet/sing-box/releases/latest" "${TMP
     ok "the plain API URL is used" || bad "the API URL was rewritten without a mirror"
 grep -qF "mirror.test" "${TMP}/curl.urls" && bad "a mirror leaked into the direct run" ||
     ok "no mirror prefix without update_mirror"
+
+echo "== a compact one-line release JSON (what the real API serves)"
+# The fake releases above are pretty-printed; api.github.com answers with one
+# line of compact JSON (285 KB measured), where a layout-dependent parser finds
+# nothing. Same release, stripped of every newline and space.
+publish 9.9.15 rel-compact ok
+tr -d '\n ' < "${DOC}/rel-compact.json" > "${DOC}/rel-compact.tmp" &&
+    mv "${DOC}/rel-compact.tmp" "${DOC}/rel-compact.json"
+eq "$(wc -l < "${DOC}/rel-compact.json")" 0 "the fixture really is one line"
+cli rel-compact.json update-core >"${TMP}/out10" 2>&1
+eq "$?" 0 "update-core parses a one-line release payload"
+eq "$(core_version)" "9.9.15" "the tag and the digest come out of the compact payload"
+
+
+echo "== a release without a published digest installs on version + check"
+# GitHub only sets `digest` for newer assets; sing-box's own tarballs have none
+# (measured on v1.14.4), so a missing digest must warn instead of refusing.
+publish 9.9.16 rel-nodigest ok "" no-digest
+cli rel-nodigest.json update-core >"${TMP}/out11" 2>&1
+eq "$?" 0 "update-core installs without a published digest"
+has "$LOG" "9.9.16 publishes no sha256 digest" "the missing digest is reported"
+eq "$(core_version)" "9.9.16" "the tarball is installed"
 
 echo
 [ "$FAIL" -eq 0 ] && echo "update-core test: pass ($PASS checks)" ||

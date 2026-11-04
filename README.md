@@ -51,7 +51,7 @@ tests/installer-test.sh               67/67 — fresh install, system/bin symlin
                                       stale watchdog killed, volume-key prompt (+) / (-) on a
                                       wall-clock window, thin zip with no core, failed download,
                                       old settings.ini rejected
-tests/update-core-test.sh             38/38 — update-core against a fake release API: digest
+tests/update-core-test.sh             44/44 — update-core against a fake release API: digest
                                       verified, swap + restart, "already latest" no-op,
                                       bad digest / failing `check` / dead core refused,
                                       previous binary restored and restarted, first core
@@ -165,7 +165,8 @@ guess the paths.
 ```
 
 `(+)` runs the same `update-core` path as the CLI: the release comes from GitHub's
-latest tag, the archive must match GitHub's sha256 digest, and the binary must
+latest tag, the archive is checked against GitHub's sha256 digest when it is
+published, and the binary must
 pass `check` with the live config. A failed download never aborts the flash — the
 bundled or installed core stays and the log says why. `PISING_INSTALL_CORE=1|0`
 answers without a key (unattended flashes, tests). With no `getevent` or `/dev/input`
@@ -258,8 +259,13 @@ have to be rebuilt or reinstalled.
 - the release comes from `api.github.com/repos/SagerNet/sing-box/releases/latest`,
   and the asset name follows `ro.product.cpu.abi` (`arm64-v8a` -> `android-arm64`,
   `armeabi-v7a` -> `android-arm`, `x86_64` -> `amd64`, `x86` -> `386`);
-- the archive must match the `sha256` digest GitHub publishes for that asset, so a
-  broken download or a proxy that rewrites the body is rejected;
+- the archive is checked against the `sha256` digest GitHub publishes for that
+  asset when the API carries one, so a broken download or a proxy that rewrites
+  the body is rejected. sing-box's tarballs currently have **no** `digest` in the
+  response (measured on v1.14.4: the APK assets do, `sing-box-1.14.4-android-arm64.tar.gz`
+  does not), so a missing digest logs a warning and the install goes ahead on the
+  weaker chain: pinned release URL over TLS, exactly one expected binary in the
+  tarball, `version` equal to the tag, and `check` passing on the live config;
 - the new binary has to answer `version` with the release tag and to pass
   `check -D run/update/check -c config/config.json` — a scratch `-D`, so the live
   `cache.db` is never touched. Only then are `bin/sing-box` and
