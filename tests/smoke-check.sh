@@ -41,9 +41,12 @@ else
 fi
 
 echo "== payload completeness"
-for f in bin/pi-sing bin/pi.iptables settings.ini \
-         config/config.json config/config.example.json \
-         lists/package.list.cfg lists/ap.list.cfg bin/sing-box; do
+# A thin build deliberately ships no core; everything else is mandatory.
+FILES="bin/pi-sing bin/pi.iptables settings.ini"
+FILES="$FILES config/config.json config/config.example.json"
+FILES="$FILES lists/package.list.cfg lists/ap.list.cfg"
+[ "${PISING_THIN:-0}" = "1" ] || FILES="$FILES bin/sing-box"
+for f in $FILES; do
     if [ -e "${PAYLOAD}/${f}" ]; then
         say "$f" "ok"
     else

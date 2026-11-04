@@ -67,6 +67,56 @@ stop_watchdog() {
 }
 stop_watchdog
 
+# ---------------------------------------------------------------- core choice
+# The zip can ship without the core (79 MiB of GPL-3.0 binary that update-core
+# can fetch from the same release). Then the only question worth asking is
+# whether to fetch it now, and the answer has to come from the volume keys: the
+# manager installer has no TTY. `getevent -lqc 1` blocks until one event, so a
+# `timeout 1` around it gives a bounded wait. /dev/input is not readable in every
+# installer context; when no key ever arrives the caller takes its default
+# instead of hanging, and the flash itself never fails because of this.
+read_volume_key() {  # $1 = seconds to wait -> "up" | "down" | nothing
+    _left="$1"
+    while [ "$_left" -gt 0 ]; do
+        _ev="$(timeout 1 getevent -lqc 1 2>/dev/null)"
+        case "$_ev" in
+            *KEY_VOLUMEUP*) printf 'up'; return 0 ;;
+            *KEY_VOLUMEDOWN*) printf 'down'; return 0 ;;
+        esac
+        _left=$((_left - 1))
+    done
+    return 1
+}
+
+# Sets ASK (1 = download now, 0 = skip) and prints the prompt. It cannot return
+# the answer on stdout: the caller would swallow the prompt along with it.
+# PISING_INSTALL_CORE=1|0 answers without a key press (managers that flash
+# unattended, and the installer test).
+ASK=0
+ask_core_download() {
+    ASK=0
+    case "${PISING_INSTALL_CORE:-ask}" in
+        1|yes|download) ASK=1; ui_print "  core  : download selected (PISING_INSTALL_CORE)"; return 0 ;;
+        0|no|skip)      ui_print "  core  : download skipped (PISING_INSTALL_CORE)"; return 0 ;;
+    esac
+    if ! command -v getevent >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
+        ui_print "  core  : no volume-key input here, downloading nothing"
+        return 0
+    fi
+    ui_print " "
+    ui_print "  This zip has no sing-box core."
+    ui_print "    Volume UP   = download it now (~24 MB, needs internet)"
+    ui_print "    Volume DOWN = skip it"
+    ui_print "    no key within 15s = skip"
+    if [ "$(read_volume_key 15)" = "up" ]; then
+        ASK=1
+        ui_print "  core  : download selected"
+    else
+        ui_print "  core  : skipped"
+    fi
+    return 0
+}
+
 # Stop a previous instance before its binary is replaced. Both entry points are
 # tried so an upgrade from the flat layout stops before it is moved.
 if [ -x "$DATA/bin/pi-sing" ] || [ -x "$DATA/pi-sing" ]; then
@@ -121,9 +171,9 @@ mkdir -p "$TMPDIR/pising"
 unzip -o "$ZIPFILE" 'payload/*' -d "$TMPDIR/pising" >&2 || abort "! cannot extract payload"
 PAYLOAD="$TMPDIR/pising/payload"
 
-# Replaced on every upgrade: the entry points, the core and its licence.
-ui_print "  update: bin/{pi-sing,pi.iptables,sing-box}"
-for f in bin/pi-sing bin/pi.iptables bin/sing-box bin/sing-box.LICENSE config/config.example.json; do
+# Replaced on every upgrade: the entry points and their licence.
+ui_print "  update: bin/{pi-sing,pi.iptables,sing-box.LICENSE}"
+for f in bin/pi-sing bin/pi.iptables bin/sing-box.LICENSE config/config.example.json; do
     cp -f "$PAYLOAD/$f" "$DATA/$f" || abort "! cannot install $f"
 done
 
@@ -153,6 +203,38 @@ PATHS
     ui_print "  update: settings.ini (path block for bin/, config/, lists/, run/)"
 fi
 
+# The core is the only big file, and a thin build leaves it out of the zip. What
+# happens then depends on the phone: an existing core is kept as is, and a phone
+# without one is asked before anything is downloaded.
+core_note() {
+    ui_print "  core  : none installed"
+    ui_print "  next  : su -c /dev/pi-sing update-core   (then: su -c /dev/pi-sing start)"
+}
+if [ -f "$PAYLOAD/bin/sing-box" ]; then
+    cp -f "$PAYLOAD/bin/sing-box" "$DATA/bin/sing-box" || abort "! cannot install bin/sing-box"
+    ui_print "  core  : bundled with this zip"
+elif [ -f "$DATA/bin/sing-box" ]; then
+    chmod 755 "$DATA/bin/sing-box" 2>/dev/null
+    ui_print "  core  : kept the one already in ${DATA}/bin"
+else
+    ask_core_download
+    if [ "$ASK" = "1" ]; then
+        ui_print "  core  : downloading the latest sing-box release"
+        if PISING_DIR="$DATA" sh "$DATA/bin/pi-sing" update-core >> "${TMPDIR:-$DATA/run}/pising-core.log" 2>&1 &&
+           [ -x "$DATA/bin/sing-box" ]; then
+            ui_print "  core  : $("$DATA/bin/sing-box" version 2>/dev/null | head -n 1)"
+        else
+            ui_print "  core  : download failed, install continues without a core"
+            tail -n 3 "${TMPDIR:-$DATA/run}/pising-core.log" 2>/dev/null | while IFS= read -r _l; do
+                ui_print "  | $_l"
+            done
+            core_note
+        fi
+    else
+        core_note
+    fi
+fi
+
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/action.sh" 0 0 0755
@@ -161,7 +243,7 @@ set_perm_recursive "$DATA" 0 0 0755 0644
 set_perm "$DATA/bin/pi-sing" 0 0 0755
 set_perm "$DATA/settings.ini" 0 0 0644
 set_perm "$DATA/bin/pi.iptables" 0 0 0755
-set_perm "$DATA/bin/sing-box" 0 0 0755
+[ -f "$DATA/bin/sing-box" ] && set_perm "$DATA/bin/sing-box" 0 0 0755
 set_perm "$DATA/bin/sing-box.LICENSE" 0 0 0644
 
 rm -rf "$TMPDIR/pising"
@@ -177,4 +259,5 @@ ui_print "  shortcut     : /dev/pi-sing"
 ui_print "  config       : $DATA/config/config.json"
 ui_print "  settings     : $DATA/settings.ini"
 ui_print "  reboot to start (service.sh), then check: su -c /dev/pi-sing status"
+[ -x "$DATA/bin/sing-box" ] || core_note
 ui_print " "

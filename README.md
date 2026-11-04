@@ -36,19 +36,25 @@ Host-side tests, run on the same kernel:
 tests/smoke-check.sh                  every script parses (dash), both configs pass `sing-box check` 1.14.4
 tests/netns-tproxy-test.sh            14/14 — TCP, UDP/53 hijack, per-app blacklist + whitelist,
                                       core-gid bypass (no capture loop), clean teardown
-tests/installer-test.sh               31/31 — fresh install, migration from the v1.0.0 flat
+tests/installer-test.sh               44/44 — fresh install, migration from the v1.0.0 flat
                                       layout (kept files, moved cache, appended paths),
                                       idempotent re-run, stale watchdog killed,
-                                      old settings.ini rejected
-tests/update-core-test.sh             25/25 — update-core against a fake release API: digest
+                                      thin zip with no core (skipped and failed download,
+                                      existing core kept), old settings.ini rejected
+tests/update-core-test.sh             29/29 — update-core against a fake release API: digest
                                       verified, swap + restart, "already latest" no-op,
                                       bad digest / failing `check` / dead core refused,
-                                      previous binary restored and restarted
+                                      previous binary restored and restarted, first core
+                                      on a thin install (no previous binary)
 ```
 
 Not verified: the `ipv6=proxy` mode (this tunnel carries IPv4 only — measured),
-hotspot/tether capture (`ap.list.cfg`), and the first boot of the service on a
-fresh reboot (the service was exercised by running `service.sh` directly).
+hotspot/tether capture (`ap.list.cfg`), an actual key press during a thin
+install — `getevent`/`timeout` exist on the ROM, `/dev/input` is readable by root
+and `timeout 1 getevent -lqc 1` returns empty after 1 s (measured), but no key was
+pressed while flashing; the installer test drives the same decision through
+`PISING_INSTALL_CORE`. Also not verified: the first boot of the service on a fresh
+reboot (the service was exercised by running `service.sh` directly).
 
 ## Layout
 
@@ -70,7 +76,7 @@ module/                     -> inside the zip
     lists/   package.list.cfg    per-app list (blacklist/whitelist)
              ap.list.cfg         interfaces whose incoming traffic is proxied
 tests/  netns-tproxy-test.sh, smoke-check.sh, installer-test.sh
-tools/  build.sh            -> dist/Pi-Sing-<version>.zip
+tools/  build.sh            -> dist/Pi-Sing-<version>.zip (full) / -thin.zip
 ```
 
 ## Build
@@ -81,12 +87,15 @@ project). Fetch the pinned release first:
 ```
 tools/fetch-sing-box.sh                 # arm64 default, --arch arm|arm64|x86_64|x86
 SINGBOX_BIN=/path/to/linux/sing-box tests/netns-tproxy-test.sh
-tools/build.sh                          # -> dist/Pi-Sing-<version>.zip + sha256
+tools/build.sh --all                    # -> dist/Pi-Sing-<version>[-thin].zip + sha256
 ```
 
 `tools/fetch-sing-box.sh` pins `sing-box 1.14.4` and verifies the tarball sha256.
-`tools/build.sh` runs `tests/smoke-check.sh` first and refuses to build without
-the binary.
+`tools/build.sh` runs `tests/smoke-check.sh` first and refuses to build the full
+zip without the binary: 79 MiB unpacked, ~24 MB compressed, i.e. almost the whole
+zip. `--thin` builds the same module without `payload/bin/sing-box` (23 KB
+measured) for people who would rather download the core on the phone; `--all`
+builds both.
 
 On the device:
 
@@ -107,6 +116,14 @@ On the device:
 old flat layout is moved into these directories by `customize.sh` (existing
 values untouched), and an older `settings.ini` gets the `*_dir` block appended —
 it does not have one, so the scripts would otherwise refuse to guess.
+
+The installer asks nothing unless the zip is a thin build, and then only on a
+phone that has no core yet: Volume Up downloads the release `update-core` follows
+(~24 MB, verified against the digest in the API response), Volume Down — or 15 s
+without a key press — skips it, `PISING_INSTALL_CORE=1|0` answers without a key.
+A failed download never aborts the flash: it prints the reason and the next step,
+and `su -c /dev/pi-sing update-core` finishes the job. A phone that already has a
+core keeps it byte for byte, so re-flashing a thin zip costs nothing.
 
 `pi-sing` and `pi.iptables` at the top of the data dir are symlinks into `bin/`
 because the manager (measured with KernelSU 3.3.1) stages a module update in
@@ -153,7 +170,8 @@ have to be rebuilt or reinstalled.
 - the file is swapped **before** the core is stopped, so a watchdog restart in
   between starts the already validated new binary, never the stale one. A running
   core is stopped and started again; if it does not stay up, the previous binary
-  is put back and started;
+  is put back and started. With no previous binary (a thin install) there is
+  nothing to back up, so the release is installed from scratch;
 - same tag as the installed core -> `update: already on the latest core (1.14.4)`,
   nothing is downloaded;
 - unauthenticated GitHub API access is limited to 60 requests/hour per IP; a 403

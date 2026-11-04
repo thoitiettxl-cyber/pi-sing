@@ -225,7 +225,7 @@ start_core() {
 
 do_start() {
     if [ ! -x "$bin_path" ]; then
-        log Error "sing-box binary missing or not executable: $bin_path"
+        log Error "no core at ${bin_path}: run 'pi-sing update-core' to install one"
         return 1
     fi
     _running="$(running_pid)"
@@ -284,8 +284,9 @@ do_stop() {
 
 do_status() {
     _pid="$(running_pid)"
-    _ver="$("$bin_path" version 2>/dev/null | head -n 1)"
-    printf 'pi-sing    : %s\n' "${_ver:-unknown}"
+    _ver=""
+    [ -x "$bin_path" ] && _ver="$("$bin_path" version 2>/dev/null | head -n 1)"
+    printf 'pi-sing    : %s\n' "${_ver:-missing - run: pi-sing update-core}"
     printf 'settings   : %s (mode=%s, port=%s, ipv6=%s, quic=%s)\n' \
         "$settings" "$proxy_mode" "$tproxy_port" "$ipv6" "$quic"
     printf 'config     : %s\n' "$config_path"
@@ -361,6 +362,16 @@ sha256_of() {  # $1 = file -> hex digest on stdout
 
 core_version() {  # $1 = binary path -> version string
     "$1" version 2>/dev/null | head -n 1 | awk '{ print $NF }'
+}
+
+# Undo the swap. A thin install has no previous core, so there is nothing to put
+# back and the new binary is removed instead (same state as before the attempt).
+restore_prev() {  # reads _upd from do_update_core
+    if [ -f "${_upd}/sing-box.prev" ]; then
+        cp -f "${_upd}/sing-box.prev" "$bin_path" && chmod 755 "$bin_path"
+    else
+        rm -f "$bin_path"
+    fi
 }
 
 do_update_core() {
@@ -442,12 +453,17 @@ do_update_core() {
     fi
 
     _was_running="$(running_pid)"
-    cp -f "$bin_path" "${_upd}/sing-box.prev" ||
-        { log Error "update: cannot back up ${bin_path}"; return 1; }
+    if [ -x "$bin_path" ]; then
+        cp -f "$bin_path" "${_upd}/sing-box.prev" ||
+            { log Error "update: cannot back up ${bin_path}"; return 1; }
+    else
+        rm -f "${_upd}/sing-box.prev"
+        log Info "update: no current core, installing ${_ver} from scratch"
+    fi
     # The file is swapped before the core is stopped, so a watchdog restart in
     # between starts the already validated new binary, never the stale one.
     if ! mv -f "${_src}/sing-box" "$bin_path" || ! chmod 755 "$bin_path"; then
-        cp -f "${_upd}/sing-box.prev" "$bin_path"
+        restore_prev
         log Error "update: cannot replace ${bin_path}"
         return 1
     fi
@@ -457,8 +473,7 @@ do_update_core() {
         do_start
     fi
     if [ -n "${_was_running:-}" ] && [ -z "$(running_pid)" ]; then
-        cp -f "${_upd}/sing-box.prev" "$bin_path"
-        chmod 755 "$bin_path"
+        restore_prev
         log Error "update: core ${_ver} did not stay up, rolled back to ${_cur:-the previous core}"
         do_start
         return 1
@@ -472,11 +487,22 @@ do_watchdog() {
     [ "$watchdog" = "1" ] || { log Info "watchdog disabled"; return 0; }
     log Info "watchdog started (${watchdog_interval}s)"
     _iface=""
+    _nocore=0
     while :; do
         sleep "$watchdog_interval"
         if [ -z "$(running_pid)" ]; then
-            log Warn "sing-box is gone, restarting"
-            do_start || sleep 30
+            if [ -x "$bin_path" ]; then
+                _nocore=0
+                log Warn "sing-box is gone, restarting"
+                do_start || sleep 30
+            elif [ "$_nocore" = "0" ]; then
+                # A thin install can boot without a core. Retrying every interval
+                # would only repeat the same error, so say it once and wait.
+                _nocore=1
+                log Warn "no core at ${bin_path}: run 'pi-sing update-core' (watchdog idle)"
+            fi
+        elif [ "$_nocore" != "0" ]; then
+            _nocore=0
         fi
         _cur="$(ip route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
         if [ -n "$_cur" ] && [ "$_cur" != "$_iface" ]; then

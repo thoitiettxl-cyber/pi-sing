@@ -226,6 +226,18 @@ eq "$(core_version)" "9.9.9" "previous binary kept"
 
 PISING_DIR="$DATA" sh "$DATA/bin/pi-sing" stop >/dev/null 2>&1
 
+# A thin install ships no core, so the first update-core has nothing to back up
+# and nothing to restore: it must simply install the release.
+echo "== first core on a thin install (no previous binary)"
+rm -f "$DATA/bin/sing-box"
+publish 9.9.13 rel-first ok
+cli rel-first.json update-core >"${TMP}/out7" 2>&1
+eq "$?" 0 "update-core exits 0 with no current core"
+has "$LOG" "update: no current core, installing 9.9.13 from scratch" "first install is reported"
+eq "$(core_version)" "9.9.13" "bin/sing-box created from the release"
+[ -e "${DATA}/run/update" ] && bad "scratch dir run/update was left behind" ||
+    ok "scratch dir run/update removed"
+
 echo
 [ "$FAIL" -eq 0 ] && echo "update-core test: pass ($PASS checks)" ||
     { echo "update-core test: ${FAIL} failure(s)"; exit 1; }

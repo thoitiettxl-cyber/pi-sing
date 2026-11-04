@@ -1,5 +1,14 @@
 #!/bin/bash
-# Build the flashable Pi-Sing zip: module/ -> dist/Pi-Sing-<version>.zip
+# Build flashable Pi-Sing zips: module/ -> dist/Pi-Sing-<version>[-thin].zip
+#
+#   tools/build.sh            full zip, the sing-box core is bundled
+#   tools/build.sh --thin     thin zip: no core, the installer asks the user to
+#                             download it (volume keys) or leaves it to update-core
+#   tools/build.sh --all      both
+#
+# Both zips install the same module; only payload/bin/sing-box is missing from the
+# thin one (79 MiB unpacked, ~24 MB compressed; it comes from the release
+# update-core follows).
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -7,28 +16,48 @@ ROOT="$(cd "${HERE}/.." && pwd)"
 MOD="${ROOT}/module"
 DIST="${ROOT}/dist"
 VER="$(sed -n 's/^version=//p' "${MOD}/module.prop")"
-OUT="${DIST}/Pi-Sing-${VER}.zip"
 
-[ -x "${MOD}/payload/bin/sing-box" ] || { echo "missing module/payload/bin/sing-box"; exit 1; }
+MODE=full
+case "${1:-}" in
+    "")        ;;
+    --thin)    MODE=thin ;;
+    --full)    MODE=full ;;
+    --all)     MODE=all ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 1 ;;
+esac
 
-SINGBOX_BIN="${SINGBOX_BIN:-}" bash "${ROOT}/tests/smoke-check.sh" || exit 1
-
-mkdir -p "$DIST"
-rm -f "$OUT"
-
-cd "$MOD"
 FILES="module.prop customize.sh service.sh action.sh uninstall.sh
 META-INF/com/google/android/update-binary META-INF/com/google/android/updater-script"
-PAYLOAD="payload/settings.ini payload/config/config.json payload/config/config.example.json
+SMALL="payload/settings.ini payload/config/config.json payload/config/config.example.json
 payload/lists/package.list.cfg payload/lists/ap.list.cfg
-payload/bin/pi-sing payload/bin/pi.iptables payload/bin/sing-box.LICENSE
-payload/bin/sing-box"
+payload/bin/pi-sing payload/bin/pi.iptables payload/bin/sing-box.LICENSE"
 
-if command -v zip >/dev/null 2>&1; then
-    # shellcheck disable=SC2086
-    zip -q -X -9 "$OUT" $FILES $PAYLOAD -x '*.DS_Store'
-else
-    python3 - "$OUT" $FILES $PAYLOAD <<'PY'
+build() {  # $1 = full|thin
+    _kind="$1"
+    if [ "$_kind" = "thin" ]; then
+        OUT="${DIST}/Pi-Sing-${VER}-thin.zip"
+        PAYLOAD="${SMALL}"
+        PISING_THIN=1 SINGBOX_BIN="${SINGBOX_BIN:-}" \
+            bash "${ROOT}/tests/smoke-check.sh" || return 1
+    else
+        [ -x "${MOD}/payload/bin/sing-box" ] ||
+            { echo "missing module/payload/bin/sing-box (tools/fetch-sing-box.sh, or --thin)"; return 1; }
+        OUT="${DIST}/Pi-Sing-${VER}.zip"
+        PAYLOAD="${SMALL} payload/bin/sing-box"
+        SINGBOX_BIN="${SINGBOX_BIN:-}" bash "${ROOT}/tests/smoke-check.sh" || return 1
+    fi
+
+    mkdir -p "$DIST"
+    rm -f "$OUT"
+
+    cd "$MOD"
+    if command -v zip >/dev/null 2>&1; then
+        # shellcheck disable=SC2086
+        zip -q -X -9 "$OUT" $FILES $PAYLOAD -x '*.DS_Store'
+    else
+        # shellcheck disable=SC2086
+        python3 - "$OUT" $FILES $PAYLOAD <<'PY'
 import os, sys, zipfile
 out, files = sys.argv[1], sys.argv[2:]
 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
@@ -40,13 +69,14 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         with open(f, 'rb') as fh:
             z.writestr(info, fh.read())
 PY
-fi
+    fi
+    cd "$ROOT"
 
-echo
-echo "built: $OUT"
-ls -lh "$OUT" | awk '{print "size : "$5}'
-sha256sum "$OUT" | awk '{print "sha256: "$1}'
-python3 - "$OUT" <<'PY'
+    echo
+    echo "built: $OUT ($_kind)"
+    ls -lh "$OUT" | awk '{print "size : "$5}'
+    sha256sum "$OUT" | awk '{print "sha256: "$1}'
+    python3 - "$OUT" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z:
     names = z.namelist()
@@ -55,7 +85,14 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         print("   ", n)
 PY
 
-# The installer is the only thing that knows the on-device layout; exercise it
-# against the zip that was just built (fresh install + migration from v1.0.0).
-echo
-bash "${ROOT}/tests/installer-test.sh" "$OUT"
+    # The installer is the only thing that knows the on-device layout; exercise it
+    # against the zip that was just built (fresh install + migration from v1.0.0).
+    echo
+    bash "${ROOT}/tests/installer-test.sh" "$OUT"
+}
+
+case "$MODE" in
+    full) build full ;;
+    thin) build thin ;;
+    all)  build full; build thin ;;
+esac

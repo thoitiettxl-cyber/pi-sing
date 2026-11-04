@@ -8,7 +8,10 @@
 #   2. upgrade from the v1.0.0 flat layout -> user files moved, not clobbered
 #   3. running the upgrade twice moves nothing (idempotent)
 #   4. a stale watchdog loop from v1.0.0 is stopped
-#   5. pi-sing refuses a pre-v1.1.0 settings.ini instead of resolving paths on "/"
+#   5. a thin zip (no core) installs without one and points at update-core
+#   6. a thin zip over an existing core keeps that core and asks nothing
+#   7. a requested core download that fails does not abort the flash
+#   8. pi-sing refuses a pre-v1.1.0 settings.ini instead of resolving paths on "/"
 #
 # Two substitutions are made on the copy of customize.sh under test:
 #   DATA=/data/adb/pi-sing -> a temp dir, and /dev/pi-sing -> a temp symlink, so
@@ -70,13 +73,39 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as z:
 PY
 }
 
-install_into() {  # $1 = DATA, $2 = MODPATH, $3 = log tag
+with_core() {  # $1 = source zip, $2 = output zip with payload/bin/sing-box present
+    python3 - "$1" "$2" <<'PY'
+import sys, zipfile
+src, out = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(src) as zi, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zo:
+    names = zi.namelist()
+    for item in zi.infolist():
+        zo.writestr(item, zi.read(item.filename))
+    if "payload/bin/sing-box" not in names:
+        zo.writestr("payload/bin/sing-box", "stub\n")
+PY
+}
+
+strip_core() {  # $1 = source zip, $2 = thin zip (same payload, no core)
+    python3 - "$1" "$2" <<'PY'
+import sys, zipfile
+src, out = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(src) as zi, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zo:
+    for item in zi.infolist():
+        if item.filename == "payload/bin/sing-box":
+            continue
+        zo.writestr(item, zi.read(item.filename))
+PY
+}
+
+install_into() {  # $1 = DATA, $2 = MODPATH, $3 = log tag, $4 = zip (default $Z)
+    _zip="${4:-$Z}"
     sed -e "s|^DATA=/data/adb/pi-sing$|DATA=$1|" \
         -e "s|/dev/pi-sing|${TMP}/dev-pi-sing|g" \
         "${ROOT}/module/customize.sh" > "${TMP}/customize.sh"
     mkdir -p "$2"
     BOOTMODE=true KSU=false APATCH=false PISING_TEST_TMP="$TMP" \
-    ZIPFILE="$Z" MODPATH="$2" TMPDIR="${TMP}/tmp" \
+    ZIPFILE="$_zip" MODPATH="$2" TMPDIR="${TMP}/tmp" \
     sh -c '
         abort() { echo "ABORT: $*" >&2; exit 1; }
         ui_print() { echo "$*"; }
@@ -89,6 +118,15 @@ install_into() {  # $1 = DATA, $2 = MODPATH, $3 = log tag
 
 if [ $# -gt 0 ]; then Z="$1"; else stage_zip; fi
 [ -f "$Z" ] || { echo "missing zip: $Z"; exit 1; }
+
+# The artifact as built, then the two variants the cases need: the core-dependent
+# cases want a zip that carries a core (a --thin artifact does not, so a stub is
+# added here), the thin cases want the same payload without one.
+Z_ART="$Z"
+Z_THIN="${TMP}/Pi-Sing-thin.zip"
+strip_core "$Z_ART" "$Z_THIN" || { echo "cannot derive the thin zip from $Z_ART"; exit 1; }
+Z="${TMP}/Pi-Sing-with-core.zip"
+with_core "$Z_ART" "$Z" || { echo "cannot derive the full zip from $Z_ART"; exit 1; }
 
 echo "== fresh install"
 DATA="${TMP}/fresh"
@@ -151,6 +189,44 @@ echo "== upgrade twice (idempotent)"
 install_into "$DATA" "${TMP}/mod-upgrade2" upgrade2 || { echo; echo "installer test: abort"; exit 1; }
 grep -q 'moved :' "${TMP}/log-upgrade2" && bad "second upgrade moved something again" || ok "second upgrade moves nothing"
 eq "$(cat "$DATA/config/config.json")" '{"user":true}' "user config still kept"
+
+echo "== pi-sing refuses a pre-v1.1.0 settings.ini"
+echo "== thin zip (no core), fresh install, download skipped"
+DATA="${TMP}/thin"
+export PISING_INSTALL_CORE=0
+install_into "$DATA" "${TMP}/mod-thin" thin "$Z_THIN" || { echo; echo "installer test: abort"; exit 1; }
+unset PISING_INSTALL_CORE
+eq "$(find "$DATA" -type f | wc -l | tr -d ' ')" 8 "8 files installed (no core)"
+[ -e "$DATA/bin/sing-box" ] && bad "a core came out of a thin zip" || ok "no core in bin/"
+[ -f "$DATA/bin/pi-sing" ] && ok "CLI installed" || bad "CLI missing"
+[ -f "$DATA/bin/sing-box.LICENSE" ] && ok "licence still shipped in a thin zip" || bad "licence missing"
+grep -q 'core  : none installed' "${TMP}/log-thin" && ok "installer says the core is missing" ||
+    bad "no notice about the missing core"
+grep -q 'update-core' "${TMP}/log-thin" && ok "notice says how to finish" ||
+    bad "notice does not name update-core"
+
+echo "== thin zip over a phone that already has a core"
+SUM_BEFORE="$(sha256sum "${TMP}/fresh/bin/sing-box" | awk '{ print $1 }')"
+DATA="${TMP}/fresh"
+install_into "$DATA" "${TMP}/mod-thin-keep" thin-keep "$Z_THIN" || { echo; echo "installer test: abort"; exit 1; }
+eq "$(sha256sum "$DATA/bin/sing-box" | awk '{ print $1 }')" "$SUM_BEFORE" "existing core left untouched"
+grep -q 'core  : kept the one already in' "${TMP}/log-thin-keep" && ok "installer reports the kept core" ||
+    bad "kept core not reported"
+grep -q 'Volume UP' "${TMP}/log-thin-keep" && bad "asked although a core is installed" ||
+    ok "no question when a core is already there"
+
+echo "== thin zip, download selected, no network"
+DATA="${TMP}/thin-dl"
+export PISING_INSTALL_CORE=1 PISING_UPDATE_API="http://127.0.0.1:1/releases/latest" PISING_UPDATE_ARCH=arm64
+install_into "$DATA" "${TMP}/mod-thin-dl" thin-dl "$Z_THIN" || { echo; echo "installer test: abort"; exit 1; }
+unset PISING_INSTALL_CORE PISING_UPDATE_API PISING_UPDATE_ARCH
+[ -e "$DATA/bin/sing-box" ] && bad "a core appeared without a server" || ok "no core after a failed download"
+grep -q 'download failed, install continues' "${TMP}/log-thin-dl" && ok "failed download does not abort the flash" ||
+    bad "failed download not reported"
+grep -q 'core  : none installed' "${TMP}/log-thin-dl" && ok "next step printed after the failure" ||
+    bad "next step missing after the failure"
+grep -q 'update: cannot fetch' "$DATA/run/pi-sing.log" && ok "update-core left its reason in run/pi-sing.log" ||
+    bad "no diagnosis in run/pi-sing.log"
 
 echo "== pi-sing refuses a pre-v1.1.0 settings.ini"
 OLD="${TMP}/old"

@@ -52,13 +52,15 @@ module/payload/config/config.example.json  minimal direct-outbound config
 module/payload/lists/package.list.cfg   per-app list (uid or package[:user])
 module/payload/lists/ap.list.cfg        interfaces whose ingress is proxied
 tools/fetch-sing-box.sh       pinned release + sha256
-tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip
+tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip (--thin/--all)
 tests/smoke-check.sh           sh -n on every script + sing-box check on both configs
 tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (14 assertions)
 tests/installer-test.sh       customize.sh on the host: fresh install, v1.0.0 layout
-                              migration, stale watchdog (SIGTERM ignored), idempotency
+                              migration, stale watchdog (SIGTERM ignored), idempotency,
+                              thin zip (no core) with PISING_INSTALL_CORE=0|1
 tests/update-core-test.sh     update-core against a fake release API served locally:
-                              digest, swap + restart, no-op, refusal, rollback
+                              digest, swap + restart, no-op, refusal, rollback, first
+                              core on a thin install (no previous binary to back up)
 ```
 
 On the device: module scripts in `/data/adb/modules/pi-sing`, everything that can
@@ -111,8 +113,9 @@ Host (this container; kernel has xt_TPROXY, `ip netns` works):
 ```
 SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
 SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 14/14 expected
-tests/update-core-test.sh                           # 25/25 expected, no device
-tools/build.sh                                      # smoke + zip in dist/
+tests/update-core-test.sh                           # 29/29 expected, no device
+tests/installer-test.sh                             # 44/44 expected, no device
+tools/build.sh --all                                # smoke + full and thin zips
 ```
 
 Device (root through android-bridge):
@@ -164,7 +167,11 @@ A useful device check set (all must hold):
 1. Bump `version` and `versionCode` in `module/module.prop`.
 2. `tools/fetch-sing-box.sh` if the pinned release changed (update
    `TARBALL_SHA256` too).
-3. `SINGBOX_BIN=... tools/build.sh` → `dist/Pi-Sing-<version>.zip` + sha256.
+3. `SINGBOX_BIN=... tools/build.sh --all` → `dist/Pi-Sing-<version>.zip` and
+   `dist/Pi-Sing-<version>-thin.zip` + sha256. The thin zip has no
+   `payload/bin/sing-box`; `customize.sh` then keeps an existing core or asks
+   (volume keys, `PISING_INSTALL_CORE=1|0` to answer without a key) before
+   downloading one with `update-core`.
 4. `SINGBOX_BIN=... tests/netns-tproxy-test.sh` and the device check set above.
 5. Commit subject: `pi-sing: <what changed>`; body explains the measurement, not
    the intention.
