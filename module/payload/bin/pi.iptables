@@ -303,15 +303,20 @@ apply_proto() {
 apply_v6_block() {
     i6 -t filter -N "$c_v6" 2>/dev/null
     i6 -t filter -F "$c_v6" 2>/dev/null
-    # DNS over IPv6 is rejected, not passed: netd would otherwise resolve over
-    # fe80::1%wlan0 (the LAN router -> ISP resolver), which is an unproxied DNS
-    # leak, and the marked link-local packet does not survive the reroute to lo.
-    # Rejecting it makes netd fall back to its IPv4 resolvers, whose queries our
-    # IPv4 mangle chain hijacks into sing-box.
-    i6 -t filter -A "$c_v6" -p udp --dport 53 -j REJECT
-    i6 -t filter -A "$c_v6" -p tcp --dport 53 -j REJECT --reject-with tcp-reset
+    # Link-local and multicast stay untouched *before* the DNS reject, because a
+    # link-local resolver is the only working one on some networks: netd held
+    # fe80::1%wlan0 as its resolver while 1.1.1.1/1.0.0.1 were marked BROKEN
+    # (18/24 and 24/24 timeouts, score 0, sample validity 1800 s), and rejecting
+    # IPv6 DNS then left it with no resolver at all: every name that was not
+    # cached failed with "unknown host" (measured 8/8 with the module running,
+    # 8/8 resolving with it stopped). Letting the link-local query out costs a
+    # DNS leak to the LAN router; the alternative is a phone without DNS.
     i6 -t filter -A "$c_v6" -d fe80::/10 -j RETURN
     i6 -t filter -A "$c_v6" -d ff00::/8 -j RETURN
+    # Global IPv6 DNS is still rejected: nothing on this path is proxied, and
+    # answering from a public resolver would be a leak with no benefit.
+    i6 -t filter -A "$c_v6" -p udp --dport 53 -j REJECT
+    i6 -t filter -A "$c_v6" -p tcp --dport 53 -j REJECT --reject-with tcp-reset
     i6 -t filter -A "$c_v6" -j REJECT
     i6 -t filter -I OUTPUT -j "$c_v6"
     i6 -t filter -I FORWARD -j "$c_v6"

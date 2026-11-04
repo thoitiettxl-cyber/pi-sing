@@ -1,6 +1,6 @@
 {
   "log": {
-    "level": "info",
+    "level": "warn",
     "timestamp": true
   },
   "dns": {
@@ -8,18 +8,13 @@
       {
         "type": "https",
         "tag": "remote_dns",
-        "server": "8.8.8.8",
-        "detour": "Default_🦈"
+        "server": "8.8.8.8"
       },
       {
         "type": "fakeip",
         "tag": "fake_dns",
-        "inet4_range": "198.18.0.0/15"
-      },
-      {
-        "type": "udp",
-        "tag": "dns-bootstrap",
-        "server": "8.8.8.8"
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
       }
     ],
     "rules": [
@@ -79,22 +74,20 @@
   "http_clients": [
     {
       "tag": "direct-http",
-      "version": 2,
-      "detour": "Direct_🦈",
-      "domain_resolver": "dns-bootstrap"
+      "version": 2
     }
   ],
   "endpoints": [
     {
       "type": "wireguard",
-      "tag": "wg-out",
+      "tag": "Proton-US_🔒",
       "address": "10.2.0.2/32",
       "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
       "peers": [
         {
           "address": "203.0.113.10",
           "port": 51820,
-          "public_key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+          "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
           "allowed_ips": [
             "0.0.0.0/0",
             "::/0"
@@ -125,10 +118,9 @@
       "type": "selector",
       "tag": "Default_🦈",
       "outbounds": [
-        "wg-out",
         "Direct_🦈"
       ],
-      "default": "wg-out",
+      "default": "Direct_🦈",
       "interrupt_exist_connections": true
     },
     {
@@ -139,9 +131,9 @@
       "type": "selector",
       "tag": "Soul_🌐",
       "outbounds": [
-        "wg-out"
+        "Proton-US_🔒"
       ],
-      "default": "wg-out",
+      "default": "Proton-US_🔒",
       "interrupt_exist_connections": true
     }
   ],

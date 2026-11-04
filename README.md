@@ -81,32 +81,48 @@ module/                     -> inside the zip
     settings.ini            every tunable (sourced, POSIX sh)
     bin/  pi-sing           CLI: start|stop|restart|status|log|iptables|watchdog
           pi.iptables       TPROXY rules: on|off|renew|status
-          sing-box          the Android arm64 binary
-    config/  config.json    sing-box config (see "leak-free config" below)
+          sing-box          NOT shipped; update-core installs it on the phone
+    config/  config.json    sing-box config (see "the shipped config" below)
              config.example.json   minimal config: tproxy inbound + direct outbound
     lists/   package.list.cfg    per-app list (blacklist/whitelist)
              ap.list.cfg         interfaces whose incoming traffic is proxied
 tests/  netns-tproxy-test.sh, smoke-check.sh, installer-test.sh
-tools/  build.sh            -> dist/Pi-Sing-<version>.zip (full) / -thin.zip
+tools/  build.sh            -> dist/Pi-Sing-<version>.zip (module only, no core)
 ```
 
 ## Build
 
-The sing-box binary is **not** committed (79 MiB, GPL-3.0 software from another
-project). Fetch the pinned release first:
+One artifact, **no sing-box binary in it** (~29 KiB measured). The core is 79 MiB
+of GPL-3.0 software from another project, and `update-core` follows the latest
+release anyway, so bundling it only made a second zip and a rebuild per core bump.
+The module gets a core on the phone instead:
+
+| how | command |
+| --- | --- |
+| at flash time | the installer always asks; `(+)` runs `update-core`, `(-)` keeps what is there |
+| later, over the air | `su -c pi-sing update-core` (sha256 from the release API, `check` against the live config, rollback if the new core does not stay up) |
+| by hand | put a binary at `/data/adb/pi-sing/bin/sing-box` (0755) — a downloaded `sing-box-*-android-arm64` |
+
+```
+tools/build.sh                          # -> dist/Pi-Sing-<version>.zip + sha256
+tools/build.sh --thin                   # accepted, same file (old commands keep working)
+tools/build.sh --full                   # refused: the core is never bundled
+```
+
+`tools/build.sh` runs `tests/smoke-check.sh` first (every script parses, both
+configs pass `check`, every payload file is present) and then the CLI, action and
+installer tests. It never copies `module/payload/bin/sing-box` into the zip, even
+when a binary is lying there for the netns test.
+
+`tools/fetch-sing-box.sh` pins `sing-box 1.14.4`, verifies the tarball sha256 and
+puts the binary in `module/payload/bin/` — for the host tests
+(`SINGBOX_BIN=... tests/netns-tproxy-test.sh`) or for pushing a core by hand. That
+path is gitignored.
 
 ```
 tools/fetch-sing-box.sh                 # arm64 default, --arch arm|arm64|x86_64|x86
 SINGBOX_BIN=/path/to/linux/sing-box tests/netns-tproxy-test.sh
-tools/build.sh --all                    # -> dist/Pi-Sing-<version>[-thin].zip + sha256
 ```
-
-`tools/fetch-sing-box.sh` pins `sing-box 1.14.4` and verifies the tarball sha256.
-`tools/build.sh` runs `tests/smoke-check.sh` first and refuses to build the full
-zip without the binary: 79 MiB unpacked, ~24 MB compressed, i.e. almost the whole
-zip. `--thin` builds the same module without `payload/bin/sing-box` (23 KB
-measured) for people who would rather download the core on the phone; `--all`
-builds both.
 
 On the device:
 
@@ -144,7 +160,7 @@ guess the paths.
 ```
   Volume keys (15 s):
     (+) UP   = download the latest sing-box core from GitHub
-    (-) DOWN = keep the core in this zip / already on the phone
+    (-) DOWN = keep the core already on the phone (none yet on a first flash)
     no key   = keep
 ```
 
@@ -317,8 +333,8 @@ never `ACCEPT`):
 of an already handled connection. `PISING_GUARD` (filter OUTPUT) rejects direct
 connections to the tproxy port and, with `quic=disable`, UDP 443/80.
 `PISING_V6BLOCK` (filter OUTPUT/FORWARD, `ipv6=block`) rejects IPv6 except
-link-local/multicast, and rejects IPv6 DNS so netd falls back to its IPv4
-resolvers, whose queries the IPv4 chain hijacks.
+link-local/multicast, and rejects **global** IPv6 DNS. Link-local DNS is let
+through on purpose: see the DNS note in the trap list.
 
 Routing: `ip rule add fwmark <fwmark> table 2027 pref 110` plus
 `ip route add local default dev lo table 2027` (the same for `ip -6` in
@@ -330,6 +346,16 @@ Routing: `ip rule add fwmark <fwmark> table 2027 pref 110` plus
   to a local app hit the `-i lo -j TPROXY` rule again: 25 236 `inbound packet
   connection` lines for one request. Bypass in `PREROUTING` is `ACCEPT`; in
   `OUTPUT` it must be `RETURN` so the vendor mangle chains still run.
+- **A rejected IPv6 DNS can leave the phone with no resolver at all.** netd held
+  `fe80::1%wlan0` plus `1.1.1.1`/`1.0.0.1`, and the IPv4 pair was marked `BROKEN`
+  (18/24 and 24/24 timeouts, score 0, sample validity 1800 s). With `ipv6=block`
+  rejecting IPv6 DNS, every name that was not already cached failed with
+  `ping: unknown host` — 8/8 fresh names with the module running, 8/8 of the same
+  names resolving with it stopped — while `nslookup <name> 1.1.1.1` from a root
+  shell still answered in 25-270 ms through the hijack. Letting link-local DNS out
+  turned that into 5/8 at once, healing as netd recovered. So `PISING_V6BLOCK`
+  returns for `fe80::/10` *before* the DNS rejects: the price is a DNS leak to the
+  LAN router, the alternative is no DNS.
 - **Bypassing the core by SO_MARK alone** (`outbound.routing_mark`) does not stop
   the DNS transport from being captured; the gid bypass (`net_admin`, 3005) does.
   SO_MARK stays as a second guard only.
@@ -342,14 +368,31 @@ Routing: `ip rule add fwmark <fwmark> table 2027 pref 110` plus
 
 ## Leak-free sing-box config (`config.json`)
 
-`module/payload/config/config.json` is a **template**: a WireGuard endpoint with
-dummy keys and `203.0.113.10` as the peer, fakeip DNS, a Clash API, two remote
-rule-sets. It is only used on a fresh install — `customize.sh` never overwrites an
-existing `/data/adb/pi-sing/config/config.json`, so a real config on the phone is
-kept across upgrades. Never commit real credentials.
+`module/payload/config/config.json` is the config that ships with the module: a
+complete, working file — mixed inbound on 127.0.0.1:7080, the TPROXY inbound on
+1536, WireGuard endpoint, fakeip DNS, Clash API (9090), the API/dashboard on 9091,
+two remote rule-sets (ads, telegram), a `find_process` route for three example
+packages, and `Default_🦈` = direct for everything else. Its only placeholders are
+the WireGuard credentials.
 
-The template already contains the five things TPROXY on Android needs. If you
-write your own config, keep the equivalent:
+It is only used on a fresh install: `customize.sh` never overwrites an existing
+`/data/adb/pi-sing/config/config.json`, so a real config on the phone survives
+upgrades. Never commit real credentials — the shipped keys are 32 zero bytes in
+base64 (`AAAA…AA=`), which `sing-box check` accepts and `run` starts with, the
+tunnel simply never completes. To use your own keys, replace
+`endpoints[0].private_key`, its `peers[0].public_key` and `peers[0].address`; to
+use your own config, `cp` it over `config/config.json` and `su -c pi-sing start`.
+
+Because `Default_🦈` is direct, a fresh flash keeps the phone online before the
+keys are filled in; only the three example packages need the tunnel. Point
+`Default_🦈` at the endpoint (or add it to the selector's `outbounds`) when
+everything should be proxied — that is also the mode the notes below assume.
+
+The self-test after `start` only proves that a proxied request succeeds, not that
+it left through the tunnel: with `Default_🦈` = direct it passes on the carrier.
+
+The shipped config already contains the five things TPROXY on Android needs. If
+you write your own, keep the equivalent:
 
 1. No `log.output` — the module redirects sing-box to
    `/data/adb/pi-sing/run/log/sing-box.log` (an `output` pointing at a directory
@@ -363,12 +406,15 @@ write your own config, keep the equivalent:
    `settings.ini` (`pi-sing start` rewrites it).
 3. `route.default_domain_resolver` must be a **tunnel-side** DNS server, so every
    name the phone dials is resolved inside the tunnel. A `type: local` server does
-   not work on Android (`read udp [::1]:53: connection refused`).
-4. Give `http_clients` a `detour` plus a `domain_resolver` (a plain direct
-   resolver such as `{"type":"udp","server":"8.8.8.8"}`): remote rule-sets are
-   initialized **before** the endpoint is up, otherwise startup dies with
-   `lookup github.com: WireGuard is not ready yet`. Only rule-set downloads use
-   that path.
+   not work on Android (`read udp [::1]:53: connection refused`). The shipped
+   config resolves through `remote_dns` (DoH to 8.8.8.8) over the default
+   outbound; add `"detour": "Soul_🌐"` when everything should resolve inside the
+   tunnel.
+4. Remote rule-sets are initialized **before** the endpoint is up, so the HTTP
+   client they use needs a working resolver: the shipped config gives them
+   `http_clients: [{"tag": "direct-http", "version": 2}]` plus
+   `route.default_http_client`/`default_domain_resolver`, which is what keeps
+   startup from dying with `lookup github.com: WireGuard is not ready yet`.
 5. The final selector defaults to the tunnel and `dns.servers[...].detour` points
    at that selector, so both traffic and DNS leave through the tunnel. Drop the
    fakeip IPv6 range when the tunnel carries IPv4 only (measured: an IPv6-only

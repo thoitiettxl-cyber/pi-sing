@@ -1,10 +1,16 @@
 #!/bin/bash
-# Download and verify the sing-box release the module ships.
+# Download and verify one sing-box binary.
 #
-# The binary is not committed: it is 79 MiB and it is GPL-3.0 software from
-# another project. tools/build.sh refuses to build without it.
+# The release zip never carries a core and the binary is not committed: it is
+# 79 MiB and it is GPL-3.0 software from another project. The module installs its
+# own core with `update-core`. This is for the host tests (smoke-check,
+# netns-tproxy-test) and for installing a core by hand:
+#   tools/fetch-sing-box.sh && adb push module/payload/bin/sing-box /data/local/tmp/
+#   su -c 'cp /data/local/tmp/sing-box /data/adb/pi-sing/bin/ && chmod 755 ...'
 #
 # Usage: tools/fetch-sing-box.sh [--arch arm64|arm|x86_64|x86] [--out path]
+#
+# Note: module/payload/bin/sing-box is gitignored, and the build leaves it out.
 set -eu
 
 VERSION="1.14.4"

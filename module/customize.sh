@@ -125,7 +125,7 @@ ask_core_update() {
     ui_print " "
     ui_print "  Volume keys (${_wait} s):"
     ui_print "    (+) UP   = download the latest sing-box core from GitHub"
-    ui_print "    (-) DOWN = keep the core in this zip / already on the phone"
+    ui_print "    (-) DOWN = keep the core already on the phone (none yet on a first flash)"
     ui_print "    no key   = keep"
     case "$(read_volume_key "$_wait")" in
         up)   ASK=1; ui_print "  keys   : (+) pressed - checking GitHub for a newer core" ;;
@@ -252,10 +252,11 @@ fi
 # rewrite the value, or move the directory. A relative path is resolved by the
 # core against its own -D, and whatever it downloads stays where the config says.
 
-# The core is the only big file. A thin zip carries none and an existing core is
-# never touched; ASK=1 means "check GitHub", which update-core does with the
-# sha256 from the release API and a `check` against the live config. A failed
-# check/download keeps the bundled or installed core and never aborts the flash.
+# The release zip carries no core (79 MiB, and `update-core` follows the latest
+# release anyway); an existing core is never touched. A zip that someone bundled
+# one into still installs it. ASK=1 means "check GitHub", which update-core does
+# with the sha256 from the release API and a `check` against the live config. A
+# failed check/download keeps the installed core and never aborts the flash.
 core_note() {
     ui_print "  core  : none installed"
     ui_print "  next  : su -c $DATA/bin/pi-sing update-core   (then: ... start)"

@@ -41,11 +41,10 @@ else
 fi
 
 echo "== payload completeness"
-# A thin build deliberately ships no core; everything else is mandatory.
+# Everything but the core is mandatory; the zip never carries the core.
 FILES="bin/pi-sing bin/pi.iptables settings.ini"
 FILES="$FILES config/config.json config/config.example.json"
 FILES="$FILES lists/package.list.cfg lists/ap.list.cfg"
-[ "${PISING_THIN:-0}" = "1" ] || FILES="$FILES bin/sing-box"
 for f in $FILES; do
     if [ -e "${PAYLOAD}/${f}" ]; then
         say "$f" "ok"
@@ -54,6 +53,13 @@ for f in $FILES; do
         FAIL=$((FAIL + 1))
     fi
 done
+# A core in the tree is only a local test artifact (fetch-sing-box.sh); the build
+# leaves it out of the zip on purpose.
+if [ -e "${PAYLOAD}/bin/sing-box" ]; then
+    say "bin/sing-box" "present locally, not shipped (update-core installs it)"
+else
+    say "bin/sing-box" "absent (the module downloads it)"
+fi
 
 echo
 [ "$FAIL" -eq 0 ] && echo "smoke check: pass" || echo "smoke check: ${FAIL} failure(s)"

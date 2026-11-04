@@ -46,13 +46,17 @@ module/META-INF/.../update-binary   unmodified Magisk module_installer.sh (GPL-3
 module/payload/settings.ini   the only knobs; sourced by both scripts
 module/payload/bin/pi-sing    CLI: start|stop|restart|status|log|iptables|update-core|watchdog
 module/payload/bin/pi.iptables  rules: on|off|renew|status
-module/payload/bin/sing-box   NOT committed; tools/fetch-sing-box.sh
-module/payload/config/config.json       TEMPLATE (no real credentials)
+module/payload/bin/sing-box   NEVER shipped and not committed; update-core installs
+                              the core on the phone (tools/fetch-sing-box.sh is for
+                              host tests / a manual push only)
+module/payload/config/config.json       the config that ships: complete and working,
+                              WireGuard keys are 32 zero bytes (no real credentials)
 module/payload/config/config.example.json  minimal direct-outbound config
 module/payload/lists/package.list.cfg   per-app list (uid or package[:user])
 module/payload/lists/ap.list.cfg        interfaces whose ingress is proxied
 tools/fetch-sing-box.sh       pinned release + sha256
-tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip (--thin/--all)
+tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip (module only,
+                              the core is never bundled; --full is refused)
 tests/smoke-check.sh          sh -n on every script + sing-box check on both configs
 tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (14 assertions)
 tests/cli-test.sh             host, stub core: dashboard resolution (relative /
@@ -108,10 +112,12 @@ untouched). Without the path block `pi-sing`/`pi.iptables` refuse to run —
 deriving `bin_dir` on "/" would be a silent misconfiguration.
 
 **The installer always prints the volume-key prompt** (UP = check GitHub for a
-newer core, DOWN = keep what is bundled/installed, 15 s no key = keep). Never make
-the prompt conditional on a thin zip again: it was invisible on the full zip and
-users reported it as a bug. `PISING_INSTALL_CORE=1|0` answers without a key and
-`PISING_KEY_WAIT=<s>` shortens the window (tests).
+newer core, DOWN = keep the core already on the phone, 15 s no key = keep). Never
+make it conditional on anything: it was once conditional and users reported the
+missing prompt as a bug. There is one zip and it carries no core, so on a first
+flash "keep" means "still no core" (the installer prints the update-core command).
+`PISING_INSTALL_CORE=1|0` answers without a key and `PISING_KEY_WAIT=<s>`
+shortens the window (tests).
 
 The wait is a **wall-clock deadline**, and the input queue is drained before the
 prompt is printed. `getevent -lqc 1` returns on the first event of *any* kind and
@@ -143,9 +149,14 @@ Why it must stay this way (each measured — see README):
 - DNS rules before every bypass, or a private resolver escapes the hijack.
 - The core bypass must be by **gid** (`net_admin`, 3005) — `outbound.routing_mark`
   alone does not stop the DNS transport from being captured.
-- `ipv6=block` must reject IPv6 DNS, so netd falls back to its IPv4 resolvers whose
-  queries the IPv4 chain hijacks. Passing IPv6 DNS through is a DNS leak
-  (netd talks to `fe80::1%wlan0`, i.e. the router → ISP).
+- `ipv6=block` returns for `fe80::/10` **before** rejecting IPv6 DNS. Measured: netd
+  held `fe80::1%wlan0` as its resolver while `1.1.1.1`/`1.0.0.1` were marked
+  `BROKEN` (18/24 and 24/24 timeouts, score 0, sample validity 1800 s), so
+  rejecting IPv6 DNS left it with no resolver: every uncached name failed with
+  `ping: unknown host` (8/8 fresh names with rules up, 8/8 resolving with them
+  down), while the hijacked IPv4 DNS answered a root shell in 25-270 ms. Letting
+  link-local DNS out fixed it (5/8 immediately, healing after). Cost: names go to
+  the LAN router (a DNS leak). Global IPv6 DNS is still rejected.
 - `-D` needs the full match spec (`-m socket --transparent`), or `PISING_DIVERT`
   survives `stop`.
 
@@ -160,7 +171,7 @@ tests/update-core-test.sh                           # 38/38 expected, no device
 tests/installer-test.sh                             # 66/66 expected, no device
 tests/cli-test.sh                                   # 29/29 expected, no device
 tests/action-test.sh                                # 32/32 expected, no device
-tools/build.sh --all                                # smoke + full and thin zips
+tools/build.sh                                      # smoke + the module zip (no core)
 ```
 
 Device (root through android-bridge):
@@ -262,15 +273,12 @@ A useful device check set (all must hold):
 ## Release
 
 1. Bump `version` and `versionCode` in `module/module.prop`.
-2. `tools/fetch-sing-box.sh` if the pinned release changed (update
-   `TARBALL_SHA256` too).
-3. `SINGBOX_BIN=... tools/build.sh --all` → `dist/Pi-Sing-<version>.zip` and
-   `dist/Pi-Sing-<version>-thin.zip` + sha256. The thin zip has no
-   `payload/bin/sing-box`; `customize.sh` then keeps an existing core or asks
-   (volume keys, `PISING_INSTALL_CORE=1|0` to answer without a key) before
-   downloading one with `update-core`.
-4. `SINGBOX_BIN=... tests/netns-tproxy-test.sh` and the device check set above.
-   `tools/build.sh --all` already runs smoke + cli-test + action-test +
-   installer-test.
+2. `SINGBOX_BIN=... tools/build.sh` → `dist/Pi-Sing-<version>.zip` + sha256,
+   module only. Nothing is pinned to a core release: the zip has none, and
+   `update-core` follows GitHub's latest (the digest comes from the same API
+   response). A core in `module/payload/bin/` (from `tools/fetch-sing-box.sh`,
+   needed by the host tests) is not copied into the zip.
+3. `SINGBOX_BIN=... tests/netns-tproxy-test.sh` and the device check set above.
+   `tools/build.sh` already runs smoke + cli-test + action-test + installer-test.
 5. Commit subject: `pi-sing: <what changed>`; body explains the measurement, not
    the intention.
