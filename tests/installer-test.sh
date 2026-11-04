@@ -6,7 +6,7 @@
 # throw-away DATA/MODPATH:
 #   1. fresh install -> directories, real wrapper files (no symlinks), state line
 #   2. upgrade from the v1.0.0 flat layout -> user files moved, not clobbered
-#   3. running the upgrade twice moves nothing (idempotent), legacy run/ui moved
+#   3. running the upgrade twice moves nothing (idempotent), run/ui is left alone
 #   4. a stale watchdog loop from v1.0.0 is stopped
 #   5. a thin zip (no core) installs without one and points at update-core
 #   6. a thin zip over an existing core keeps that core, after the (-) prompt
@@ -140,22 +140,21 @@ with_core "$Z_ART" "$Z" || { echo "cannot derive the full zip from $Z_ART"; exit
 echo "== fresh install"
 DATA="${TMP}/fresh"
 install_into "$DATA" "${TMP}/mod-fresh" fresh || { echo; echo "installer test: abort"; exit 1; }
-eq "$(find "$DATA" -type f | wc -l | tr -d ' ')" 11 "11 files installed"
-eq "$(ls "$DATA" | LC_ALL=C sort | tr '\n' ' ')" "bin config lists pi-sing pi.iptables run settings.ini " "top level: settings.ini + 4 dirs + 2 entry points"
-[ -f "$DATA/pi-sing" ] && [ ! -L "$DATA/pi-sing" ] && ok "pi-sing is a real wrapper file, not a symlink" ||
-    bad "pi-sing is missing or still a symlink"
-grep -q "exec $DATA/bin/pi-sing \"\$@\"" "$DATA/pi-sing" && ok "wrapper execs bin/pi-sing" ||
-    bad "wrapper does not exec bin/pi-sing"
-[ -f "$DATA/pi.iptables" ] && [ ! -L "$DATA/pi.iptables" ] && ok "pi.iptables is a real wrapper file" ||
-    bad "pi.iptables is missing or still a symlink"
+eq "$(find "$DATA" -type f | wc -l | tr -d ' ')" 9 "9 files installed"
+eq "$(ls "$DATA" | LC_ALL=C sort | tr '\n' ' ')" "bin config lists run settings.ini " "top level: settings.ini + 4 dirs"
+[ -e "$DATA/pi-sing" ] && bad "a wrapper file is back at the top of the data dir" ||
+    ok "no entry point in the data dir (system/bin owns it)"
+[ -e "$DATA/pi.iptables" ] && bad "a pi.iptables wrapper is back" || ok "no pi.iptables wrapper either"
+eq "$(readlink "${TMP}/mod-fresh/system/bin/pi-sing")" "$DATA/bin/pi-sing" \
+   "the module ships system/bin/pi-sing -> bin/pi-sing"
+eq "$(readlink "${TMP}/mod-fresh/system/bin/pi.iptables")" "$DATA/bin/pi.iptables" \
+   "the module ships system/bin/pi.iptables -> bin/pi.iptables"
+eq "$(head -c 2 "$DATA/bin/pi-sing")" "#!" "the real script stays in bin/"
 for f in bin/pi-sing bin/pi.iptables bin/sing-box config/config.json \
          config/config.example.json lists/package.list.cfg lists/ap.list.cfg; do
     [ -f "$DATA/$f" ] && ok "$f" || bad "missing $f"
 done
-[ -f "${TMP}/dev-pi-sing" ] && [ ! -L "${TMP}/dev-pi-sing" ] && ok "shortcut is a real file" ||
-    bad "shortcut missing or a symlink"
-grep -q "exec $DATA/bin/pi-sing" "${TMP}/dev-pi-sing" && ok "shortcut execs bin/pi-sing" ||
-    bad "shortcut does not exec bin/pi-sing"
+[ -e "${TMP}/dev-pi-sing" ] && bad "/dev/pi-sing is still created" || ok "no /dev shortcut any more"
 grep -q '^bin_dir=' "$DATA/settings.ini" && ok "settings.ini defines bin_dir" || bad "settings.ini has no bin_dir"
 grep -q '^log_dir=' "$DATA/settings.ini" && ok "settings.ini defines log_dir" || bad "settings.ini has no log_dir"
 grep -q '^description=⚪ Installed' "${TMP}/mod-fresh/module.prop" && ok "staged module.prop shows the install state" ||
@@ -204,25 +203,26 @@ eq "$(grep -c '^data_dir=' "$DATA/settings.ini")" 1 "settings.ini not rewritten 
 eq "$(PISING_DIR="$DATA" sh -c '. "$PISING_DIR/settings.ini"; printf "%s|%s|%s" "$bin_dir" "$config_dir" "$list_dir"')" \
    "$DATA/bin|$DATA/config|$DATA/lists" "appended block resolves the new layout"
 eq "$(head -c 3 "$DATA/bin/pi-sing")" "#!/" "bin/pi-sing is the new script, not the old one"
-[ -f "$DATA/pi-sing" ] && [ ! -L "$DATA/pi-sing" ] && ok "old flat pi-sing replaced by a wrapper file" || bad "old flat pi-sing not replaced by a wrapper"
-eq "$(ls "$DATA" | LC_ALL=C sort | tr '\n' ' ')" "bin config lists pi-sing pi.iptables run settings.ini " "no flat files left at the top"
+[ -e "$DATA/pi-sing" ] && bad "the old flat pi-sing came back as a file" || ok "old flat pi-sing is gone"
+eq "$(ls "$DATA" | LC_ALL=C sort | tr '\n' ' ')" "bin config lists run settings.ini " "no flat files left at the top"
 grep -q 'moved : pi-sing -> bin/pi-sing' "${TMP}/log-upgrade" && ok "migration is reported" || bad "migration not reported"
 eq "$(head -c 3 "$DATA/bin/pi-sing")" "#!/" "bin/pi-sing still a real script after re-install"
 
 echo "== upgrade twice (idempotent)"
-# A dashboard created by the old -D run/ layout lives in run/ui; the new rule
-# resolves a relative "ui" next to config.json, so the installer moves it once.
+# services[].dashboard belongs to sing-box: a dashboard directory the core put
+# under -D (run/ui) stays where it is, and the installer touches neither the
+# value nor the directory.
 CFG_UI='{"user":true,"services":[{"type":"api","dashboard":"ui"}]}'
 echo "$CFG_UI" > "$DATA/config/config.json"
 mkdir -p "$DATA/run/ui" && echo '<html>old</html>' > "$DATA/run/ui/index.html"
+rm -f "${TMP}/dev-pi-sing"
 install_into "$DATA" "${TMP}/mod-upgrade2" upgrade2 || { echo; echo "installer test: abort"; exit 1; }
-eq "$(cat "$DATA/config/ui/index.html" 2>/dev/null)" "<html>old</html>" "run/ui moved next to config.json"
-[ -d "$DATA/run/ui" ] && bad "run/ui left behind after the move" || ok "run/ui is gone"
-grep -q 'moved : run/ui -> config/ui' "${TMP}/log-upgrade2" && ok "the move is reported" ||
-    bad "the dashboard move is not reported"
+eq "$(cat "$DATA/run/ui/index.html" 2>/dev/null)" "<html>old</html>" "run/ui is left alone"
+[ -e "$DATA/config/ui" ] && bad "the installer created config/ui" || ok "no config/ui invented"
+grep -q 'run/ui' "${TMP}/log-upgrade2" && bad "the installer mentions run/ui" || ok "the installer says nothing about the dashboard"
 grep -q 'moved : config' "${TMP}/log-upgrade2" && bad "second upgrade moved a data file again" ||
     ok "second upgrade moves no user data"
-eq "$(cat "$DATA/config/config.json")" "$CFG_UI" "user config still kept (dashboard line included)"
+eq "$(cat "$DATA/config/config.json")" "$CFG_UI" "user config kept byte for byte"
 
 echo "== pi-sing refuses a pre-v1.1.0 settings.ini"
 echo "== thin zip (no core), fresh install, download skipped"
@@ -230,7 +230,7 @@ DATA="${TMP}/thin"
 export PISING_INSTALL_CORE=0
 install_into "$DATA" "${TMP}/mod-thin" thin "$Z_THIN" || { echo; echo "installer test: abort"; exit 1; }
 export PISING_INSTALL_CORE=0
-eq "$(find "$DATA" -type f | wc -l | tr -d ' ')" 10 "10 files installed (no core)"
+eq "$(find "$DATA" -type f | wc -l | tr -d ' ')" 8 "8 files installed (no core)"
 [ -e "$DATA/bin/sing-box" ] && bad "a core came out of a thin zip" || ok "no core in bin/"
 [ -f "$DATA/bin/pi-sing" ] && ok "CLI installed" || bad "CLI missing"
 [ -f "$DATA/bin/sing-box.LICENSE" ] && ok "licence still shipped in a thin zip" || bad "licence missing"

@@ -5,14 +5,12 @@
 # The core is a shell stub: version/check/run, and `run` stays up until it is
 # killed. pi.iptables is a no-op so the test never edits the host's rules.
 #
-#   1. dashboard "ui" is resolved next to config.json, not against -D run/
-#   2. dashboard object {"path": ...} is resolved the same way
-#   3. an absolute dashboard path is left alone
-#   4. core_log_level overrides log.level in config.json ("config" leaves it)
-#   5. module.prop says 🟢 running / 🔴 stopped, and only changes when it changes
-#   6. module.log and sing-box.log stay separate; the core log rotates per start
-#   7. `pi-sing log` and `pi-sing log core` read the two files
-#   8. module.log rotates at 256 KiB
+#   1. services[].dashboard is left exactly as written (sing-box owns that path)
+#   2. core_log_level overrides log.level in config.json ("config" leaves it)
+#   3. module.prop says 🟢 running / 🔴 stopped, and only changes when it changes
+#   4. module.log and sing-box.log stay separate; the core log rotates per start
+#   5. `pi-sing log` and `pi-sing log core` read the two files
+#   6. module.log rotates at 256 KiB
 #
 # Usage: tests/cli-test.sh
 set -u
@@ -111,19 +109,21 @@ chmod 755 "$DATA/bin/sing-box"
 printf 'id=pi-sing\nname=Pi-Sing\nversion=v1.4.0\ndescription=test\n' > "$MOD/module.prop"
 
 # --------------------------------------------------------------------- run
-echo "== dashboard next to config.json"
+echo "== services[].dashboard belongs to sing-box, the module leaves it alone"
 write_config '"ui"'
 cli start >/dev/null 2>&1
-eq "$(grep -o '"dashboard": "[^"]*"' "$DATA/config/config.json")" \
-   "\"dashboard\": \"${DATA}/config/ui\"" "relative \"ui\" -> config/ui"
-has "$DATA/run/log/module.log" "dashboard: ui -> ${DATA}/config/ui" "the change is logged"
+eq "$(grep -o '"dashboard": "[^"]*"' "$DATA/config/config.json")" '"dashboard": "ui"' \
+   "a relative dashboard value is not rewritten"
+[ -e "$DATA/config/ui" ] && bad "the module created config/ui" || ok "the module creates no dashboard directory"
+[ -d "$DATA/run/ui" ] && bad "the module created run/ui" || ok "the module creates no run/ui either"
+hasnt "$DATA/run/log/module.log" "dashboard" "nothing about the dashboard is logged"
 hasnt "$DATA/run/log/module.log" "+0700" "no core line in module.log"
 has "$DATA/run/log/sing-box.log" "start ==" "the core log has its run header"
 eq "$(grep '^description=' "$MOD/module.prop" | head -n1)" \
    "description=🟢 Running (pid $(cat "$DATA/run/pi-sing.pid")) | sing-box + TPROXY blacklist, 1536" \
    "module.prop shows the running pid"
-cli status | grep -q "dashboard  : ${DATA}/config/ui" && ok "status prints the dashboard path" ||
-    bad "status does not print the dashboard path"
+cli status > "${TMP}/st-dash.out" 2>&1
+hasnt "${TMP}/st-dash.out" "dashboard" "status prints nothing about the dashboard"
 
 _MTIME="$(stat -c %Y "$MOD/module.prop")"
 sleep 1
@@ -137,17 +137,16 @@ cli mark "🔴 Disabled (enabled=0)" >/dev/null 2>&1
 eq "$(grep '^description=' "$MOD/module.prop")" "description=🔴 Disabled (enabled=0) | sing-box + TPROXY blacklist, 1536" \
    "mark sets an arbitrary state"
 
-echo "== dashboard as an object and as an absolute path"
+echo "== the object and absolute forms are untouched too"
 reset
 write_config '{ "path": "dash2", "update_interval": "24h" }'
 cli start >/dev/null 2>&1
-eq "$(grep -o '"path": "[^"]*"' "$DATA/config/config.json")" \
-   "\"path\": \"${DATA}/config/dash2\"" "object path -> config/dash2"
+eq "$(grep -o '"path": "[^"]*"' "$DATA/config/config.json")" '"path": "dash2"' \
+   "an object dashboard path is not rewritten"
 reset
 write_config "\"${TMP}/ui-abs\""
 cli start >/dev/null 2>&1
-has "$DATA/config/config.json" "\"dashboard\": \"${TMP}/ui-abs\"" "absolute path untouched"
-hasnt "$DATA/run/log/module.log" "dashboard: " "an absolute path needs no rewrite (no log line)"
+has "$DATA/config/config.json" "\"dashboard\": \"${TMP}/ui-abs\"" "an absolute path is untouched"
 
 echo "== core log level"
 reset

@@ -58,16 +58,18 @@ tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (14 assertions)
 tests/cli-test.sh             host, stub core: dashboard resolution (relative /
                               object / absolute), core_log_level, 🟢/🔴 description,
                               log split/rotation, watchdog vs a user stop, a decoy
-                              process that mentions bin_path is not the core (29)
+                              process that mentions bin_path is not the core,
+                              services[].dashboard left alone (30)
 tests/action-test.sh          host: fail-closed state (rules stay, core dies) and
                               the action button's one-press OFF, the 🟠 card, the
                               watchdog not repainting 🟢 over it, a core that dies
                               during the probes taking the rules with it (28)
-tests/installer-test.sh       customize.sh on the host: fresh install, wrapper files
-                              (no symlinks), v1.0.0 migration, run/ui -> config/ui,
-                              stale watchdog (SIGTERM ignored), idempotency, volume
-                              keys via a fake getevent (wall-clock window, drained
-                              queue), thin zip with/without a core (66)
+tests/installer-test.sh       customize.sh on the host: fresh install, system/bin
+                              symlinks into the data dir (no wrapper files, nothing in
+                              /dev), v1.0.0 migration, run/ui left alone, stale watchdog
+                              (SIGTERM ignored), idempotency, volume keys via a fake
+                              getevent (wall-clock window, drained queue), thin zip
+                              with/without a core (67)
 tests/update-core-test.sh     update-core against a fake release API served locally:
                               digest, swap + restart, no-op, refusal, rollback, first
                               core on a thin install (no previous binary to back up),
@@ -78,23 +80,30 @@ On the device: module scripts in `/data/adb/modules/pi-sing`, everything that ca
 change in `/data/adb/pi-sing`:
 
 ```
+module/system/bin/      pi-sing, pi.iptables: symlinks -> /data/adb/pi-sing/bin/*
 settings.ini            only real file at the top (defines bin_dir, config_dir,
                         list_dir, run_dir, log_dir)
 bin/                    pi-sing, pi.iptables, sing-box, sing-box.LICENSE
-config/                 config.json, config.example.json, ui/ (dashboard)
+config/                 config.json, config.example.json
 lists/                  package.list.cfg, ap.list.cfg
 run/                    pid, stopped (stop intent), generated lists, cache (-D run/)
 run/log/                module.log, sing-box.log (+.1 each)
-pi-sing, pi.iptables    real wrapper files that exec bin/ -- required until the
-                        next reboot, see the traps below
 ```
 
-`/dev/pi-sing` is a **real wrapper file**, not a symlink (service.sh recreates it
-each boot because /dev is a tmpfs). The flat v1.0.0 layout is migrated by
-`customize.sh`, which appends the `*_dir`, `log_dir` and `core_log_level` lines to
-an old `settings.ini` (existing values untouched). Without the path block
-`pi-sing`/`pi.iptables` refuse to run — deriving `bin_dir` on "/" would be a silent
-misconfiguration.
+The CLI is exposed through the module's `system/bin`, which the manager's mount
+hook (Magisk magic mount, or the Hybrid Mount metamodule on this phone) overlays
+onto `/system/bin` — the same shape as `/data/adb/modules/droidspaces` ->
+`/system/bin/droidspaces` (a symlink into `/data`). Do not reintroduce wrapper
+files in the data dir or in `/dev`: that was v1.5.0 and older, and the installer
+now removes them. The symlink target is the data dir on purpose — the scripts are
+replaced there by `update-core` and reinstalls without waiting for the mount.
+Nothing in the module may depend on `pi-sing` being on PATH: `service.sh`,
+`action.sh`, `customize.sh` and the installer call `$DATA/bin/pi-sing`.
+
+The flat v1.0.0 layout is migrated by `customize.sh`, which appends the `*_dir`,
+`log_dir` and `core_log_level` lines to an old `settings.ini` (existing values
+untouched). Without the path block `pi-sing`/`pi.iptables` refuse to run —
+deriving `bin_dir` on "/" would be a silent misconfiguration.
 
 **The installer always prints the volume-key prompt** (UP = check GitHub for a
 newer core, DOWN = keep what is bundled/installed, 15 s no key = keep). Never make
@@ -193,10 +202,15 @@ A useful device check set (all must hold):
   can kill the live one (measured while testing `update-core`).
 - KernelSU 3.3.1 stages a module update in `/data/adb/modules_update` and applies
   `service.sh`/`action.sh` only on the next boot. Between an in-app upgrade and a
-  reboot the previous boot script still runs, which is why `customize.sh` keeps
-  `/data/adb/pi-sing/pi-sing` as a **real wrapper file** into `bin/` (not a
-  symlink). Never write through an existing `/dev/pi-sing` without `rm -f` first:
-  v1.3.0 left a symlink there and a redirect would overwrite `bin/pi-sing`.
+  reboot the previous boot script still runs; it calls `$DATA/bin/pi-sing`, which
+  the installer has already replaced, so nothing has to be created in `/dev` for
+  that window (v1.5.0 wrote `/dev/pi-sing` from `service.sh` for it). The
+  `system/bin` symlinks appear at the next boot with the mount.
+- **`services[].dashboard` is sing-box's.** The module does not resolve, rewrite
+  or move it, `status` does not print it, and the installer touches neither the
+  value nor `run/ui` (the old code rewrote a relative value to `<config_dir>/ui`
+  and moved `run/ui` there). A relative value resolves against the core's own `-D`
+  (`run/`). Tested in `tests/cli-test.sh` and `tests/installer-test.sh`.
 - **The watchdog restarts a crashed core but must not undo a user stop.** `stop`
   writes `run/stopped` before killing the core, `start` removes it, and the
   watchdog loop skips restart *and* rule renewal while it exists. Without the flag,

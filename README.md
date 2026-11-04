@@ -18,12 +18,12 @@ KernelSU 3.3.1, busybox 1.36.1.1 at `/data/adb/ksu/bin/busybox`, iptables 1.8.11
 (legacy) with `TPROXY`, `owner`, `mark`, `socket`, `addrtype` and `SET` available,
 uids in `package.list.cfg` resolved from `/data/system/packages.list`.
 
-Measured with the module running (`su -c /dev/pi-sing status` → running, rules
+Measured with the module running (`su -c pi-sing status` → running, rules
 installed, watchdog up):
 
 | check | command | result |
 | --- | --- | --- |
-| traffic capture | `su -c /dev/pi-sing log core 200` while an app connects | `inbound/tproxy[tproxy-in]: inbound connection …` for the request; the outbound row then shows the config's chosen outbound (this config sends most rules through a `direct` tag, so the exit address is the carrier's) |
+| traffic capture | `su -c pi-sing log core 200` while an app connects | `inbound/tproxy[tproxy-in]: inbound connection …` for the request; the outbound row then shows the config's chosen outbound (this config sends most rules through a `direct` tag, so the exit address is the carrier's) |
 | DNS through the tunnel | `curl -o /dev/null -w '%{remote_ip}' https://www.wikipedia.org` | `198.18.0.32` — a sing-box **fakeip**, so the name was resolved by sing-box, not by Android |
 | resolver as the outside world sees it | `curl -sL https://edns.ip-api.com/json` | `Singapore - Google LLC` (`172.253.211.85`), i.e. the resolver named in config.json, not the ISP resolver |
 | IPv6 leak | `curl -6 https://ipv6.icanhazip.com` | fails (`rc=6`) and `PISING_V6BLOCK` rejects it; the phone's own `2402:800:…` address never reaches the network |
@@ -36,7 +36,7 @@ Host-side tests, run on the same kernel:
 tests/smoke-check.sh                  every script parses (dash), both configs pass `sing-box check` 1.14.4
 tests/netns-tproxy-test.sh            14/14 — TCP, UDP/53 hijack, per-app blacklist + whitelist,
                                       core-gid bypass (no capture loop), clean teardown
-tests/cli-test.sh                     29/29 — dashboard resolution (relative/object/absolute),
+tests/cli-test.sh                     30/30 — services[].dashboard is left untouched,
                                       core_log_level, 🟢/🔴 description, log split, log rotation,
                                       watchdog leaves a user-stopped core stopped, a process
                                       that only mentions the core path is not the core
@@ -44,11 +44,12 @@ tests/action-test.sh                  28/28 — fail-closed state (rules stay, c
                                       action button's one-press OFF, the 🟠 card, the watchdog
                                       not repainting 🟢, a core that dies during the probes
                                       taking the rules with it
-tests/installer-test.sh               66/66 — fresh install, wrapper files (no symlinks),
-                                      migration from the v1.0.0 flat layout, run/ui move,
-                                      idempotent re-run, stale watchdog killed, volume-key
-                                      prompt (+) / (-) on a wall-clock window, thin zip with no
-                                      core, failed download, old settings.ini rejected
+tests/installer-test.sh               67/67 — fresh install, system/bin symlinks into the
+                                      data dir, no entry point in $DATA, migration from the
+                                      v1.0.0 flat layout, run/ui left alone, idempotent re-run,
+                                      stale watchdog killed, volume-key prompt (+) / (-) on a
+                                      wall-clock window, thin zip with no core, failed download,
+                                      old settings.ini rejected
 tests/update-core-test.sh             38/38 — update-core against a fake release API: digest
                                       verified, swap + restart, "already latest" no-op,
                                       bad digest / failing `check` / dead core refused,
@@ -110,17 +111,25 @@ On the device:
 
 ```
 /data/adb/modules/pi-sing/      module.prop, service.sh, action.sh, uninstall.sh
+  system/bin/pi-sing            symlink -> /data/adb/pi-sing/bin/pi-sing
+  system/bin/pi.iptables        symlink -> /data/adb/pi-sing/bin/pi.iptables
 /data/adb/pi-sing/              everything that changes, grouped by purpose
   settings.ini                  the only real file at the top: every knob
   bin/                          pi-sing, pi.iptables, sing-box, sing-box.LICENSE
   config/                       config.json, config.example.json
   lists/                        package.list.cfg, ap.list.cfg
-  config/ui/                    dashboard served by services.api (created by sing-box)
   run/                          pid, stop intent, generated lists, sing-box cache.db
   run/log/                      module.log, sing-box.log (+.1 each)
-  pi-sing, pi.iptables          real wrapper files that exec bin/ (no symlinks)
-/dev/pi-sing                    real wrapper file, recreated by service.sh at boot
 ```
+
+`system/bin` is the only place the CLI is exposed. The manager's mount hook
+(Magisk magic mount, or Hybrid Mount — the KernelSU metamodule installed on this
+phone) overlays the module's `system/bin` onto `/system/bin`, exactly the way
+`/data/adb/modules/droidspaces` exposes `/system/bin/droidspaces`. The module
+ships **symlinks into the data dir**, not copies: `update-core` and a reinstall
+replace the scripts in place, without waiting for a mount that only happens at
+boot. Nothing is written to `/dev`, and the data dir holds no wrapper files any
+more (v1.5.0 and older did; the installer removes them).
 
 `bin/` and `config/config.example.json` are replaced on upgrade; `settings.ini`,
 `config/config.json` and the two files in `lists/` are kept. An install from the
@@ -145,27 +154,25 @@ bundled or installed core stays and the log says why. `PISING_INSTALL_CORE=1|0`
 answers without a key (unattended flashes, tests). With no `getevent` or `/dev/input`
 in the installer context, the default (keep) is taken after printing the prompt.
 
-The top-level `pi-sing` and `pi.iptables` are **real wrapper files** (a 3-line
-`exec` into `bin/`), not symlinks: a backup/copy tool that drops links leaves a
-working path, and `ls -l` shows a script. They exist because the manager (measured
-with KernelSU 3.3.1) stages a module update in `/data/adb/modules_update` and
-applies its `service.sh`/`action.sh` only on the next boot: until then the previous
-boot script runs, and it calls `/data/adb/pi-sing/pi-sing`. `/dev/pi-sing` is a
-real wrapper file too and is recreated by `service.sh` on every boot (its tmpfs is
-empty after a reboot). A watchdog loop from the previous version is killed by the
-installer (SIGTERM then SIGKILL — the loop survives SIGTERM on this ROM).
+The CLI symlinks only appear in `/system/bin` after the next boot (the mount
+runs once, at boot; measured with KernelSU 3.3.1, which stages a module update in
+`/data/adb/modules_update` and applies its scripts on the next boot). Until then,
+and in every script of the module itself, the absolute path is used:
+`su -c /data/adb/pi-sing/bin/pi-sing start`. The installer prints both. A watchdog
+loop from the previous version is killed by the installer (SIGTERM then SIGKILL —
+the loop survives SIGTERM on this ROM).
 
 ## Usage
 
 ```
-su -c /dev/pi-sing start        # run sing-box, install the rules, self-test
-su -c /dev/pi-sing stop         # remove the rules, stop sing-box (the watchdog stays down)
-su -c /dev/pi-sing restart
-su -c /dev/pi-sing status       # process, rules, dashboard path, log paths
-su -c /dev/pi-sing log 80       # module.log (events)
-su -c /dev/pi-sing log core 80  # sing-box.log (the core's own output)
-su -c /dev/pi-sing iptables off|on|renew|status
-su -c /dev/pi-sing update-core  # install the latest sing-box from GitHub
+su -c pi-sing start             # run sing-box, install the rules, self-test
+su -c pi-sing stop              # remove the rules, stop sing-box (the watchdog stays down)
+su -c pi-sing restart
+su -c pi-sing status            # process, rules, log paths
+su -c pi-sing log 80            # module.log (events)
+su -c pi-sing log core 80       # sing-box.log (the core's own output)
+su -c pi-sing iptables off|on|renew|status
+su -c pi-sing update-core       # install the latest sing-box from GitHub
 ```
 
 `action.sh` (manager action button) does the same toggle and ends with
@@ -213,38 +220,18 @@ unchanged.
 
 ## Dashboard (`services[].dashboard`)
 
-sing-box serves the file server at `http://127.0.0.1:9091/dashboard/`. The path in
-`config.json` is authoritative:
+`services[].dashboard` is sing-box's, and the module does not touch it: it does
+not resolve the path, rewrite the value, move the directory, or print it in
+`status`. A relative path is resolved by the core against its own `-D`
+(`/data/adb/pi-sing/run`), so `"dashboard": "ui"` ends up in `run/ui` and sing-box
+fills it there on start (the official dashboard, ~8 MB, downloaded once). An
+absolute path is used as written. Point it wherever you like in `config.json`;
+`pi-sing start` will not edit the file for it.
 
-- a **relative** path is resolved **next to `config.json`** (`"ui"` →
-  `config/ui`), never against `-D run/`; `../ui` puts it beside `config/`, an
-  **absolute** path is used as is;
-- if the directory is empty, sing-box downloads its official dashboard into it
-  (needs network once, ~8 MB);
-- an existing directory without sing-box's `.etag` is treated as user-provided and
-  is served without auto-update.
-
-`pi-sing start` rewrites only that one value (string or `{"path": …}` form) when it
-is relative, so the folder really lives where `config.json` says. The installer
-moves a dashboard left in `run/ui` by the old `-D run/` resolution to `config/ui`
-once, instead of downloading it again. `pi-sing status` prints the resolved path.
-
-`start` runs a **self-test** after installing the rules: one request from a socket
-the rules exempt (direct) and one the rules must capture (proxied). Direct OK +
-proxied failing means the tunnel is down → rules stay (fail closed, no leak), and
-the card says `🟠 Tunnel down - tap to stop`: the phone is offline until the
-tunnel is fixed or the proxy is turned off. `run/selftest.failed` records that
-state, so the watchdog cannot repaint the card `🟢`; the next start that passes
-clears it. Both failing means the rules themselves are wrong → they are removed
-so the phone keeps its connection. `selftest=0` disables it.
-
-The rules **never outlive the core**: a start or restart that ends without a
-running core drops them and logs why (`removing the TPROXY rules so the phone
-keeps its connection`). A captured packet with nobody listening is a phone with
-no internet, and that state used to survive until somebody ran `stop`. The same
-rule as `box_for_magisk`'s `box_bin_alive` / `restart_box` (no pid → `iptables
-disable`); the difference is that a *live* core with a dead tunnel still keeps
-the rules (no leak), and then the action button's one press is the way out.
+The module used to rewrite a relative value to `<config_dir>/ui` and move an old
+`run/ui` there. That was module logic for a core feature, it rewrote a user file
+on every start, and it is gone (`box_for_magisk` does the same: its config has the
+key and the core does the rest).
 
 ## Updating the core
 
@@ -365,11 +352,10 @@ write your own config, keep the equivalent:
 
 1. No `log.output` — the module redirects sing-box to
    `/data/adb/pi-sing/run/log/sing-box.log` (an `output` pointing at a directory
-   that does not exist is fatal). Every other relative path in the config
-   (`cache_file.path`, `services[].dashboard` if you leave it relative before the
-   first start) resolves inside `/data/adb/pi-sing/run/`, because `pi-sing` runs
-   the core with `-D /data/adb/pi-sing/run`; the module rewrites only the
-   dashboard path, relative to `config/`.
+   that does not exist is fatal). Every relative path in the config
+   (`cache_file.path`, `services[].dashboard`) resolves inside
+   `/data/adb/pi-sing/run/`, because `pi-sing` runs the core with
+   `-D /data/adb/pi-sing/run`. The module leaves those values alone.
 2. One `{"type": "tproxy"}` inbound; its `listen_port` is owned by
    `settings.ini` (`pi-sing start` rewrites it).
 3. `route.default_domain_resolver` must be a **tunnel-side** DNS server, so every
@@ -396,11 +382,11 @@ A selector may be used as a DNS `detour`, a plain `direct` outbound may not
   but adding it (`0x00400000`) is harmless.
 - If you point DNS at a resolver that is only reachable inside the tunnel, keep
   `dns-bootstrap` available for rule-set downloads.
-- After any edit: `su -c /dev/pi-sing restart` (or `iptables renew`).
+- After any edit: `su -c pi-sing restart` (or `iptables renew`).
 - The module rewrites three values on start so `settings.ini` stays in charge:
   the tproxy inbound's `listen_port`, `outbound.routing_mark` (when present) and
-  `log.level` (from `core_log_level`); plus a **relative** `services[].dashboard`
-  path, which becomes absolute under `config/`.
+  `log.level` (from `core_log_level`). Nothing else — `services[].dashboard` is
+  sing-box's.
 
 ## License and vendored parts
 

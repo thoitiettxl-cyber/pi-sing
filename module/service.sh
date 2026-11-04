@@ -15,18 +15,11 @@ log() {
     printf '%s [Info] [svc] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${LOG_DIR}/module.log" 2>/dev/null
 }
 
-# /dev is a fresh tmpfs every boot, so the real wrapper file (not a symlink) has
-# to be recreated here. A runner in /dev survives until the next reboot.
-write_shortcut() {
-    [ -d /dev ] || return 0
-    # v1.3.0 left a symlink here; writing through it would overwrite bin/pi-sing.
-    rm -f /dev/pi-sing 2>/dev/null
-    printf '#!/system/bin/sh\nexec %s/bin/pi-sing "$@"\n' "$DATA" > /dev/pi-sing 2>/dev/null &&
-        chmod 755 /dev/pi-sing 2>/dev/null
-    return 0
-}
-
-write_shortcut
+# The CLI is reachable as `pi-sing` through /system/bin, which the manager's magic
+# mount (Magisk) or Hybrid Mount (KernelSU metamodule) fills from the module's
+# system/bin. Nothing to create at boot; a leftover /dev/pi-sing from v1.x is
+# removed instead, so there is only one entry point.
+rm -f /dev/pi-sing 2>/dev/null
 
 [ -f "${DATA}/settings.ini" ] || exit 0
 . "${DATA}/settings.ini"

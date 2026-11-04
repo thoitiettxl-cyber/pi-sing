@@ -11,5 +11,7 @@ if [ -x "$RULES" ]; then
     "$RULES" off >/dev/null 2>&1
 fi
 
-rm -f /dev/pi-sing
+# v1.x kept the entry points here and in /dev; both are gone, the module's
+# system/bin symlinks disappear with the module directory.
+rm -f /dev/pi-sing "$DATA/pi-sing" "$DATA/pi.iptables"
 rm -rf "$DATA"

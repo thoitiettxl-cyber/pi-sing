@@ -186,81 +186,9 @@ drop_rules_if_dead() {
     update_state
     return 0
 }
-# Sets _dash_line/_dash_old/_dash_new from services[].dashboard. A relative path
-# is resolved next to config.json, never against -D run/: the dashboard files
-# belong with the config that names them. An absolute path is used untouched.
-read_dashboard() {
-    _dash_line=0 _dash_old="" _dash_new=""
-    [ -f "$config_path" ] || return 1
-    _found="$(awk -v base="$config_dir" '
-        function resolve(p) { return (p ~ /^\//) ? p : base "/" p }
-        { line[NR] = $0 }
-        END {
-            for (i = 1; i <= NR; i++) {
-                if (line[i] ~ /"dashboard"[ \t]*:[ \t]*"/) {
-                    v = line[i]
-                    sub(/^.*"dashboard"[ \t]*:[ \t]*"/, "", v)
-                    sub(/".*$/, "", v)
-                    if (v != "") print i "\t" v "\t" resolve(v)
-                    exit
-                }
-                if (line[i] ~ /"dashboard"[ \t]*:[ \t]*\{/) {
-                    # a one-line object: { "path": "ui" } on the same line
-                    if (line[i] ~ /"path"[ \t]*:[ \t]*"/) {
-                        v = line[i]
-                        sub(/^.*"path"[ \t]*:[ \t]*"/, "", v)
-                        sub(/".*$/, "", v)
-                        if (v != "") print i "\t" v "\t" resolve(v)
-                        exit
-                    }
-                    for (j = i + 1; j <= NR; j++) {
-                        if (line[j] ~ /^[ \t]*\}/) break
-                        if (line[j] ~ /"path"[ \t]*:[ \t]*"/) {
-                            v = line[j]
-                            sub(/^.*"path"[ \t]*:[ \t]*"/, "", v)
-                            sub(/".*$/, "", v)
-                            if (v != "") print j "\t" v "\t" resolve(v)
-                            exit
-                        }
-                    }
-                    exit
-                }
-            }
-        }' "$config_path")"
-    [ -n "${_found:-}" ] || return 1
-    _dash_line="${_found%%"$TAB"*}"
-    _rest="${_found#*"$TAB"}"
-    _dash_old="${_rest%%"$TAB"*}"
-    _dash_new="${_rest#*"$TAB"}"
-    return 0
-}
-
-dashboard_path() {
-    read_dashboard || return 0
-    printf '%s' "$_dash_new"
-}
-
-sync_dashboard() {
-    read_dashboard || return 0
-    [ "$_dash_old" = "$_dash_new" ] && return 0
-    _tmp="${run_dir}/config.dash.tmp"
-    awk -v ln="$_dash_line" -v abs="$_dash_new" '
-        NR == ln {
-            if ($0 ~ /"dashboard"[ \t]*:[ \t]*\{/)
-                sub(/"path"[ \t]*:[ \t]*"[^"]*"/, "\"path\": \"" abs "\"")
-            else if ($0 ~ /"dashboard"[ \t]*:/)
-                sub(/"dashboard"[ \t]*:[ \t]*"[^"]*"/, "\"dashboard\": \"" abs "\"")
-            else
-                sub(/"path"[ \t]*:[ \t]*"[^"]*"/, "\"path\": \"" abs "\"")
-        }
-        { print }' "$config_path" > "$_tmp" 2>/dev/null
-    if [ -s "$_tmp" ]; then
-        mv -f "$_tmp" "$config_path"
-        log Info "dashboard: ${_dash_old} -> ${_dash_new}"
-    fi
-    rm -f "$_tmp"
-    return 0
-}
+# services[].dashboard is sing-box's business: the module does not resolve the
+# path, rewrite the value, or move the directory, and `status` does not print it.
+# A relative path is resolved by the core against its own -D.
 
 # settings.ini owns the core log level. The core writes into log/sing-box.log,
 # and one INFO line per connection is the bulk of the module's disk writes on a
@@ -399,7 +327,6 @@ sync_config() {
     fi
     # optional second loop guard: sing-box sets SO_MARK on its own outbound sockets
     sed -i "s/\(\"routing_mark\"[[:space:]]*:[[:space:]]*\)[0-9]\+/\1${routing_mark}/g" "$config_path"
-    sync_dashboard
     sync_log_level
     return 0
 }
@@ -573,14 +500,6 @@ do_status() {
         printf 'iptables   : hooked into mangle PREROUTING only\n'
     else
         printf 'iptables   : not hooked\n'
-    fi
-    _dash="$(dashboard_path)"
-    if [ -n "${_dash:-}" ]; then
-        if [ -d "$_dash" ]; then
-            printf 'dashboard  : %s (served by services.api)\n' "$_dash"
-        else
-            printf 'dashboard  : %s (missing, the core fills it on start)\n' "$_dash"
-        fi
     fi
     printf 'logs       : %s/{module,sing-box}.log\n' "$log_dir"
     return 0
