@@ -1,7 +1,8 @@
 #!/system/bin/sh
 # Pi-Sing control CLI.
 #
-#   pi-sing start | stop | restart | status | log [n] | iptables <arg> | watchdog
+#   pi-sing start | stop | restart | status | log [n] | iptables <arg> | update-core
+#   pi-sing watchdog
 #
 # start  : validate settings and config, run sing-box, then install TPROXY rules
 # stop   : remove TPROXY rules first, then stop sing-box
@@ -309,6 +310,164 @@ do_log() {
     return 0
 }
 
+# ----------------------------------------------------------- core update
+# `update-core` follows GitHub's "latest" release, so nothing is pinned here: the
+# tag and the asset's sha256 digest both come from the same API response, and the
+# download is verified against that digest. A new core must pass `check` with the
+# live config and must stay up after start, otherwise the previous binary is put
+# back. PISING_UPDATE_* exist for the tests only.
+UPDATE_API="${PISING_UPDATE_API:-https://api.github.com/repos/SagerNet/sing-box/releases/latest}"
+UPDATE_DL="${PISING_UPDATE_DL:-https://github.com/SagerNet/sing-box/releases/download}"
+
+# ro.product.cpu.abi -> the GOARCH tag in the release asset name.
+core_arch() {
+    _abi="${PISING_UPDATE_ARCH:-$(getprop ro.product.cpu.abi 2>/dev/null)}"
+    [ -n "${_abi:-}" ] || _abi="$(uname -m 2>/dev/null)"
+    case "$_abi" in
+        arm64*|aarch64*)         printf 'arm64' ;;
+        armeabi*|armv7*|armv8l*) printf 'arm' ;;
+        x86_64*|amd64*)          printf 'amd64' ;;
+        x86|i?86*)               printf '386' ;;
+        *) return 1 ;;
+    esac
+}
+
+# $3 = "keep" leaves an HTTP error body in $2: the GitHub API answers 403 with an
+# explanation worth reading, and the download is still checked by digest.
+fetch_url() {  # $1 = url, $2 = output file, $3 = keep (optional)
+    _opt="-f"
+    [ "${3:-}" = "keep" ] && _opt=""
+    if command -v curl >/dev/null 2>&1; then
+        curl -sSL $_opt --retry 2 --connect-timeout 15 -m 300 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        return 1
+    fi
+}
+
+sha256_of() {  # $1 = file -> hex digest on stdout
+    _bb="$(find_busybox)"
+    if [ -n "${_bb:-}" ] && "$_bb" sha256sum "$1" >/dev/null 2>&1; then
+        "$_bb" sha256sum "$1" | awk '{ print $1; exit }'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print $1; exit }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{ print $1; exit }'
+    else
+        return 1
+    fi
+}
+
+core_version() {  # $1 = binary path -> version string
+    "$1" version 2>/dev/null | head -n 1 | awk '{ print $NF }'
+}
+
+do_update_core() {
+    _arch="$(core_arch)" ||
+        { log Error "update: unsupported cpu abi ($(getprop ro.product.cpu.abi 2>/dev/null))"; return 1; }
+    _upd="${run_dir}/update"
+    rm -rf "$_upd"
+    mkdir -p "$_upd" || { log Error "update: cannot create ${_upd}"; return 1; }
+
+    log Info "update: querying the latest sing-box release (android-${_arch})"
+    if ! fetch_url "$UPDATE_API" "${_upd}/release.json" keep; then
+        log Error "update: cannot fetch ${UPDATE_API} (no network?)"
+        return 1
+    fi
+    _tag="$(sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "${_upd}/release.json" | head -n 1)"
+    if [ -z "${_tag:-}" ]; then
+        log Error "update: no tag_name in the API response (rate limited?), see ${_upd}/release.json"
+        return 1
+    fi
+    _ver="${_tag#v}"
+    _tar="sing-box-${_ver}-android-${_arch}.tar.gz"
+
+    _cur="$(core_version "$bin_path")"
+    if [ "${_cur:-}" = "$_ver" ]; then
+        log Info "update: already on the latest core (${_ver})"
+        rm -rf "$_upd"
+        return 0
+    fi
+
+    # The digest sits in the same asset object as the name; scan forward until
+    # the next asset starts so another asset's digest is never picked up.
+    _want="$(awk -v name="\"name\": \"${_tar}\"" '
+        index($0, name) { on = 1; next }
+        on && /"name":[[:space:]]*"/ { exit }
+        on && /"digest":[[:space:]]*"sha256:/ {
+            sub(/.*"digest":[[:space:]]*"sha256:/, "")
+            sub(/".*/, "")
+            print
+            exit
+        }' "${_upd}/release.json")"
+    if [ -z "${_want:-}" ]; then
+        log Error "update: ${_tag} publishes no sha256 digest for ${_tar}, refusing to install it"
+        return 1
+    fi
+
+    log Info "update: ${_cur:-unknown} -> ${_ver}, downloading ${_tar}"
+    if ! fetch_url "${UPDATE_DL}/${_tag}/${_tar}" "${_upd}/${_tar}"; then
+        log Error "update: download failed: ${UPDATE_DL}/${_tag}/${_tar}"
+        return 1
+    fi
+    _got="$(sha256_of "${_upd}/${_tar}")" ||
+        { log Error "update: no sha256sum/shasum on this device"; return 1; }
+    if [ "$_got" != "$_want" ]; then
+        log Error "update: sha256 mismatch for ${_tar} (want ${_want}, got ${_got})"
+        return 1
+    fi
+    log Info "update: sha256 ok (${_want})"
+
+    ( cd "$_upd" && tar -xzf "$_tar" ) >> "$log_file" 2>&1 ||
+        { log Error "update: cannot extract ${_tar}"; return 1; }
+    _src="${_upd}/sing-box-${_ver}-android-${_arch}"
+    [ -f "${_src}/sing-box" ] ||
+        { log Error "update: ${_tar} contains no sing-box binary"; return 1; }
+    _lic=""
+    [ -f "${_src}/LICENSE" ] && _lic="${_src}/LICENSE"
+    chmod 755 "${_src}/sing-box"
+
+    _newver="$(core_version "${_src}/sing-box")"
+    case "${_newver:-}" in
+        "$_ver"*) ;;
+        *) log Error "update: downloaded binary reports '${_newver:-no output}', expected ${_ver}"; return 1 ;;
+    esac
+    # -D a scratch dir: the live cache.db belongs to the running core.
+    mkdir -p "${_upd}/check"
+    if [ -f "$config_path" ] &&
+       ! "${_src}/sing-box" check -D "${_upd}/check" -c "$config_path" >> "$log_file" 2>&1; then
+        log Error "update: core ${_ver} rejects ${config_path}, keeping ${_cur:-the current core}"
+        return 1
+    fi
+
+    _was_running="$(running_pid)"
+    cp -f "$bin_path" "${_upd}/sing-box.prev" ||
+        { log Error "update: cannot back up ${bin_path}"; return 1; }
+    # The file is swapped before the core is stopped, so a watchdog restart in
+    # between starts the already validated new binary, never the stale one.
+    if ! mv -f "${_src}/sing-box" "$bin_path" || ! chmod 755 "$bin_path"; then
+        cp -f "${_upd}/sing-box.prev" "$bin_path"
+        log Error "update: cannot replace ${bin_path}"
+        return 1
+    fi
+    [ -n "$_lic" ] && cp -f "$_lic" "${bin_dir}/sing-box.LICENSE"
+    if [ -n "${_was_running:-}" ]; then
+        do_stop >/dev/null 2>&1
+        do_start
+    fi
+    if [ -n "${_was_running:-}" ] && [ -z "$(running_pid)" ]; then
+        cp -f "${_upd}/sing-box.prev" "$bin_path"
+        chmod 755 "$bin_path"
+        log Error "update: core ${_ver} did not stay up, rolled back to ${_cur:-the previous core}"
+        do_start
+        return 1
+    fi
+    log Info "update: core ${_cur:-unknown} -> ${_ver} (android-${_arch})"
+    rm -rf "$_upd"
+    return 0
+}
+
 do_watchdog() {
     [ "$watchdog" = "1" ] || { log Info "watchdog disabled"; return 0; }
     log Info "watchdog started (${watchdog_interval}s)"
@@ -337,9 +496,10 @@ case "${1:-}" in
     status)   do_status ;;
     log)      shift; do_log "${1:-40}" ;;
     iptables) shift; "${bin_dir}/pi.iptables" "${1:-status}" ;;
+    update-core) do_update_core ;;
     watchdog) do_watchdog ;;
     *)
-        printf 'usage: %s {start|stop|restart|status|log [n]|iptables <on|off|renew|status>|watchdog}\n' "$0" >&2
+        printf 'usage: %s {start|stop|restart|status|log [n]|iptables <on|off|renew|status>|update-core|watchdog}\n' "$0" >&2
         exit 1
         ;;
 esac

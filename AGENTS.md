@@ -44,7 +44,7 @@ module/action.sh              manager action button -> toggle
 module/uninstall.sh           stop, drop rules, delete /data/adb/pi-sing
 module/META-INF/.../update-binary   unmodified Magisk module_installer.sh (GPL-3.0)
 module/payload/settings.ini   the only knobs; sourced by both scripts
-module/payload/bin/pi-sing    CLI: start|stop|restart|status|log|iptables|watchdog
+module/payload/bin/pi-sing    CLI: start|stop|restart|status|log|iptables|update-core|watchdog
 module/payload/bin/pi.iptables  rules: on|off|renew|status
 module/payload/bin/sing-box   NOT committed; tools/fetch-sing-box.sh
 module/payload/config/config.json       TEMPLATE (no real credentials)
@@ -57,6 +57,8 @@ tests/smoke-check.sh           sh -n on every script + sing-box check on both co
 tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (14 assertions)
 tests/installer-test.sh       customize.sh on the host: fresh install, v1.0.0 layout
                               migration, stale watchdog (SIGTERM ignored), idempotency
+tests/update-core-test.sh     update-core against a fake release API served locally:
+                              digest, swap + restart, no-op, refusal, rollback
 ```
 
 On the device: module scripts in `/data/adb/modules/pi-sing`, everything that can
@@ -109,6 +111,7 @@ Host (this container; kernel has xt_TPROXY, `ip netns` works):
 ```
 SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
 SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 14/14 expected
+tests/update-core-test.sh                           # 25/25 expected, no device
 tools/build.sh                                      # smoke + zip in dist/
 ```
 
@@ -147,6 +150,10 @@ A useful device check set (all must hold):
   reading `/proc/<pid>/cmdline` instead; never `pkill` from a split pattern.
 - **The watchdog loop survives SIGTERM** (measured: `kill -15` returned 0 and the
   `sh` stayed in its `sleep`, its `sleep` child died). Escalate to SIGKILL.
+- **`pidof sing-box` matches every sing-box process**, so `find_pid` cannot tell
+  two cores apart; `do_stop` trusts `run/pi-sing.pid` first for that reason. A
+  second core (or a test harness) must use its own `bin_name`, otherwise a stop
+  can kill the live one (measured while testing `update-core`).
 - KernelSU 3.3.1 stages a module update in `/data/adb/modules_update` and applies
   `service.sh`/`action.sh` only on the next boot. Between an in-app upgrade and a
   reboot the previous boot script still runs, which is why `customize.sh` keeps

@@ -40,6 +40,10 @@ tests/installer-test.sh               31/31 — fresh install, migration from th
                                       layout (kept files, moved cache, appended paths),
                                       idempotent re-run, stale watchdog killed,
                                       old settings.ini rejected
+tests/update-core-test.sh             25/25 — update-core against a fake release API: digest
+                                      verified, swap + restart, "already latest" no-op,
+                                      bad digest / failing `check` / dead core refused,
+                                      previous binary restored and restarted
 ```
 
 Not verified: the `ipv6=proxy` mode (this tunnel carries IPv4 only — measured),
@@ -121,6 +125,7 @@ su -c /dev/pi-sing restart
 su -c /dev/pi-sing status
 su -c /dev/pi-sing log 80
 su -c /dev/pi-sing iptables off|on|renew|status
+su -c /dev/pi-sing update-core  # install the latest sing-box from GitHub
 ```
 
 `action.sh` (manager action button) does the same toggle.
@@ -130,6 +135,35 @@ the rules exempt (direct) and one the rules must capture (proxied). Direct OK +
 proxied failing means the tunnel is down → rules stay (fail closed, no leak).
 Both failing means the rules themselves are wrong → they are removed so the phone
 keeps its connection. `selftest=0` disables it.
+
+## Updating the core
+
+`pi-sing update-core` installs the latest sing-box release; the module does not
+have to be rebuilt or reinstalled.
+
+- the release comes from `api.github.com/repos/SagerNet/sing-box/releases/latest`,
+  and the asset name follows `ro.product.cpu.abi` (`arm64-v8a` -> `android-arm64`,
+  `armeabi-v7a` -> `android-arm`, `x86_64` -> `amd64`, `x86` -> `386`);
+- the archive must match the `sha256` digest GitHub publishes for that asset, so a
+  broken download or a proxy that rewrites the body is rejected;
+- the new binary has to answer `version` with the release tag and to pass
+  `check -D run/update/check -c config/config.json` — a scratch `-D`, so the live
+  `cache.db` is never touched. Only then are `bin/sing-box` and
+  `bin/sing-box.LICENSE` replaced;
+- the file is swapped **before** the core is stopped, so a watchdog restart in
+  between starts the already validated new binary, never the stale one. A running
+  core is stopped and started again; if it does not stay up, the previous binary
+  is put back and started;
+- same tag as the installed core -> `update: already on the latest core (1.14.4)`,
+  nothing is downloaded;
+- unauthenticated GitHub API access is limited to 60 requests/hour per IP; a 403
+  leaves the API body in `run/update/release.json` and the core untouched.
+
+Measured on the device (Android 17, arm64-v8a): against the real API it reported
+`already on the latest core (1.14.4)`; the whole path (digest, extraction,
+`check`, swap, start) ran in a throw-away data dir against a `file://` release
+whose tarball carried the installed 1.14.4 binary — 8/8 checks, live core pid
+unchanged.
 
 ## settings.ini
 
