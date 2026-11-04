@@ -5,6 +5,19 @@ proxy (TPROXY, TCP + UDP, no TUN) on a rooted Android phone. Not a generic
 sing-box frontend: every rule here exists because of something measured on a real
 device (Android 17, kernel 6.12, KernelSU 3.3.1) — see `README.md`.
 
+## The rule behind the rules
+
+> Cái giá phải trả là rẻ nhất, cho mọi công việc có chất lượng tốt nhất.
+
+Pay the cheapest price that still buys the best result, on every job. In this
+repo that is a measurement, not a slogan: one `read` per file instead of 34 `cat`
+forks (400 ms -> 35 ms per watchdog tick), the tick that already exists instead
+of a new process and timer, the `system/bin` symlink the manager already mounts
+instead of a wrapper in `/dev`, the user's own DNS `detour` kept instead of a
+config rewrite once an A/B showed the rewrite bought nothing. Cheapest is
+measured against the result, never instead of it: if the cheap version cannot be
+shown to work, it is not cheaper, it is unfinished.
+
 ## Non-negotiables
 
 These are not style preferences; each one prevents a concrete failure.
