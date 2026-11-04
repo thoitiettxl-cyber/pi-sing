@@ -413,6 +413,9 @@ do_start() {
         update_state
         return 0
     fi
+    # A fresh attempt gets a fresh verdict; the already-running branch above keeps
+    # the old one, because nothing is probed again there.
+    rm -f "$selftest_failed_file"
     sync_config || return 1
     prepare_core_log
     if ! check_config; then
@@ -420,6 +423,12 @@ do_start() {
         update_desc "🔴 Config error"
         return 1
     fi
+    # `check` never opens log.output, `run` does (measured: a config from
+    # box_for_magisk points at /data/adb/box/run/sing-box.log and the core dies
+    # with "start logger: open ...: no such file or directory" one second after
+    # the rules went in). Advice only; the module does not edit the config.
+    grep -q '"output"[[:space:]]*:' "$config_path" 2>/dev/null &&
+        log Warn "config: log.output is set; the module redirects the core to ${core_log}, and a path that does not exist is fatal at start"
     log Info "starting ${bin_name} (log: ${core_log})"
     # shellcheck disable=SC2046
     start_core "$bin_path" run -D "$run_dir" -c "$config_path" $(core_flags)
@@ -444,6 +453,7 @@ do_start() {
         drop_rules_if_dead
         return 1
     fi
+    update_state
     return 0
 }
 

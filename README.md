@@ -40,10 +40,11 @@ tests/cli-test.sh                     30/30 — services[].dashboard is left unt
                                       core_log_level, 🟢/🔴 description, log split, log rotation,
                                       watchdog leaves a user-stopped core stopped, a process
                                       that only mentions the core path is not the core
-tests/action-test.sh                  28/28 — fail-closed state (rules stay, core dies), the
+tests/action-test.sh                  32/32 — fail-closed state (rules stay, core dies), the
                                       action button's one-press OFF, the 🟠 card, the watchdog
-                                      not repainting 🟢, a core that dies during the probes
-                                      taking the rules with it
+                                      not repainting 🟢, a stale verdict not carried into the
+                                      next start, log.output warned about, a core that dies
+                                      during the probes taking the rules with it
 tests/installer-test.sh               67/67 — fresh install, system/bin symlinks into the
                                       data dir, no entry point in $DATA, migration from the
                                       v1.0.0 flat layout, run/ui left alone, idempotent re-run,
@@ -352,7 +353,9 @@ write your own config, keep the equivalent:
 
 1. No `log.output` — the module redirects sing-box to
    `/data/adb/pi-sing/run/log/sing-box.log` (an `output` pointing at a directory
-   that does not exist is fatal). Every relative path in the config
+   that does not exist is fatal, and `check` does not catch it: it passes, then
+   `run` dies with `start logger: open ...: no such file or directory`; `start`
+   logs a warning when it sees the key). Every relative path in the config
    (`cache_file.path`, `services[].dashboard`) resolves inside
    `/data/adb/pi-sing/run/`, because `pi-sing` runs the core with
    `-D /data/adb/pi-sing/run`. The module leaves those values alone.

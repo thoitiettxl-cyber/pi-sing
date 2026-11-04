@@ -184,6 +184,35 @@ eq "$?" "0" "restart succeeds when both probes pass"
 eq "$(card)" "description=🟢 Running (pid $(cat "$DATA/run/pi-sing.pid")) | sing-box + TPROXY blacklist, 1536" \
    "the card is 🟢 after a passing self-test"
 
+echo "== a stale verdict is not carried into the next start"
+# run/selftest.failed from the previous attempt must not paint the card 🟠 when
+# this start proves the tunnel: the measured bug was a card that stayed
+# "🟠 Tunnel down" after a fully successful start (the marker was read before
+# the probes ran and nothing repainted it).
+: > "$DATA/run/selftest.failed"
+kill -9 "$(cat "$DATA/run/pi-sing.pid")" 2>/dev/null
+sleep 0.3
+FAIL_PROXIED=0 cli start >/dev/null 2>&1
+eq "$?" "0" "the fresh start passes"
+eq "$(card)" "description=🟢 Running (pid $(cat "$DATA/run/pi-sing.pid")) | sing-box + TPROXY blacklist, 1536" \
+   "the card is 🟢, not the previous 🟠"
+[ -f "$DATA/run/selftest.failed" ] && bad "the old verdict survived" || ok "the old verdict is gone"
+
+echo "== a config that logs to a file gets a warning"
+# check passes with log.output, run dies (measured with a box_for_magisk config
+# pointing at /data/adb/box/run/sing-box.log). The module does not edit the
+# config, but it says what is wrong before the core starts.
+write_cfg_output() {
+    # core_log_level has rewritten "level" by now, so match the log line itself
+    sed -i '/"log": {/ s#"level": "[a-z]*"#"level": "warn", "output": "/data/adb/box/run/sing-box.log"#' \
+        "$DATA/config/config.json"
+    grep -q '"output"' "$DATA/config/config.json" || bad "the test config has no log.output"
+}
+write_cfg_output
+cli stop >/dev/null 2>&1          # the warning is printed by a real start
+FAIL_PROXIED=0 cli start >/dev/null 2>&1
+has "$DATA/run/log/module.log" "log.output is set" "log.output is reported before the start"
+
 echo "== a core that dies while the probes run takes the rules with it"
 # The rules must never outlive the core (box_for_magisk: no pid -> iptables
 # disable): a captured packet with nobody listening is a phone with no internet.

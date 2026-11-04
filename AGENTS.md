@@ -62,8 +62,10 @@ tests/cli-test.sh             host, stub core: dashboard resolution (relative /
                               services[].dashboard left alone (30)
 tests/action-test.sh          host: fail-closed state (rules stay, core dies) and
                               the action button's one-press OFF, the 🟠 card, the
-                              watchdog not repainting 🟢 over it, a core that dies
-                              during the probes taking the rules with it (28)
+                              watchdog not repainting 🟢 over it, a stale verdict not
+                              carried into the next start, log.output warned about,
+                              a core that dies during the probes taking the rules
+                              with it (32)
 tests/installer-test.sh       customize.sh on the host: fresh install, system/bin
                               symlinks into the data dir (no wrapper files, nothing in
                               /dev), v1.0.0 migration, run/ui left alone, stale watchdog
@@ -157,7 +159,7 @@ SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 14/14 expected
 tests/update-core-test.sh                           # 38/38 expected, no device
 tests/installer-test.sh                             # 66/66 expected, no device
 tests/cli-test.sh                                   # 29/29 expected, no device
-tests/action-test.sh                                # 28/28 expected, no device
+tests/action-test.sh                                # 32/32 expected, no device
 tools/build.sh --all                                # smoke + full and thin zips
 ```
 
@@ -242,6 +244,12 @@ A useful device check set (all must hold):
   and `stop` SIGKILLed it (the agent's own shell, exit 137). Never `pkill -f` a
   path from a bridge command either: the pattern matches the command you are
   running.
+- **`sing-box check` does not open `log.output`, `run` does.** Measured with a
+  box_for_magisk config (2026-11-04): `check` exits 0, then `run` dies with
+  `start logger: open /data/adb/box/run/sing-box.log: no such file or directory`
+  one second after the rules went in. `do_start` logs a warning when the key is
+  present, and `drop_rules_if_dead` removes the rules the dead core left behind,
+  so the phone stays online. Do not "fix" the user's config: report it.
 - **`--disable-color` is detected, not assumed** (`run --help | grep`), and the log
   level is written into config.json from `core_log_level` (default `warn`). One
   INFO line per connection was 4 633 B/min on the device; at warn an idle core
