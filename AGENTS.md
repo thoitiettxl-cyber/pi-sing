@@ -1,0 +1,138 @@
+# Pi-Sing — agent guide
+
+Magisk / KernelSU / APatch module that runs **only sing-box** as a transparent
+proxy (TPROXY, TCP + UDP, no TUN) on a rooted Android phone. Not a generic
+sing-box frontend: every rule here exists because of something measured on a real
+device (Android 17, kernel 6.12, KernelSU 3.3.1) — see `README.md`.
+
+## Non-negotiables
+
+These are not style preferences; each one prevents a concrete failure.
+
+1. **Never proxy the host container's traffic.** The Debian container this agent
+   runs in reaches the internet *through the phone*, on `ds-br0` / `ds-v*` /
+   `vgate0`. `bypass_interfaces` (default `ds-br+ ds-v+ vgate0 dummy0`) and the
+   `172.16.0.0/12` entry in `PISING_BYPASS`/`PISING_SKIP` are what keep that path
+   alive. Never remove them, never add `ds-*`, `vgate*` or `wlan+` to
+   `ap.list.cfg`, and check the container's own exit IP after every rule change:
+   `curl -4 -s https://api.ipify.org` must stay the phone's carrier address.
+2. **Never reboot the phone to test.** The agent's own session dies with the
+   network. Exercise `service.sh` by running it directly.
+3. **Arm a revert before touching device rules.** Pattern: `run/keep` absent +
+   `sleep N; [ -f run/keep ] || pi-sing stop` in the background, then apply, then
+   verify, then `touch run/keep`. If anything looks wrong, `pi-sing stop` through
+   the bridge — the bridge is a unix socket, it works without a network.
+4. **Never commit credentials.** `module/payload/config.json` is a **template**
+   with dummy keys and `203.0.113.10`. The real config lives only at
+   `/data/adb/pi-sing/config.json` on the phone and is never copied into the repo.
+   `customize.sh` keeps an existing config on upgrade, so the template is only
+   used on a fresh install.
+5. **One command per `su -c`.** `su -c 'a; b'` over android-bridge runs in the
+   shell domain (no `/data/adb` access, iptables `Permission denied`). Push a
+   script and run `su -c 'sh /data/local/tmp/x.sh'`.
+6. **POSIX sh only.** Every script is run by Android's `/system/bin/sh` (mksh) and
+   validated with dash: `sh -n`. No arrays, no `[[ ]]`, no `local` assumptions, no
+   bashisms.
+
+## Layout
+
+```
+module/module.prop            id=pi-sing, version/versionCode bump per release
+module/customize.sh           installer; SKIPUNZIP=1; must extract module.prop itself
+module/service.sh             boot service: wait for sys.boot_completed + default route
+module/action.sh              manager action button -> toggle
+module/uninstall.sh           stop, drop rules, delete /data/adb/pi-sing
+module/META-INF/.../update-binary   unmodified Magisk module_installer.sh (GPL-3.0)
+module/payload/pi-sing        CLI: start|stop|restart|status|log|iptables|watchdog
+module/payload/pi.iptables    rules: on|off|renew|status
+module/payload/settings.ini   the only knobs; sourced by both scripts
+module/payload/config.json    sing-box config TEMPLATE (no real credentials)
+module/payload/config.example.json   minimal direct-outbound config
+module/payload/package.list.cfg      per-app list (uid or package[:user])
+module/payload/ap.list.cfg           interfaces whose ingress is proxied
+module/payload/bin/sing-box   NOT committed; tools/fetch-sing-box.sh
+tools/fetch-sing-box.sh       pinned release + sha256
+tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip
+tests/smoke-check.sh           sh -n on every script + sing-box check on both configs
+tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (14 assertions)
+```
+
+On the device: module scripts in `/data/adb/modules/pi-sing`, everything that can
+change in `/data/adb/pi-sing` (`settings.ini`, `config.json`, the two lists,
+`pi-sing`, `pi.iptables`, `bin/sing-box`, `run/`). `/dev/pi-sing` is a symlink to
+the CLI.
+
+## Rule contract (do not reorder without re-measuring)
+
+`PISING_EXT` in mangle `PREROUTING`: bypass interfaces → DNS (53 tcp/udp) TPROXY →
+`PISING_BYPASS` (**ACCEPT**) → `-i lo` TPROXY → `ap.list.cfg` interfaces TPROXY.
+
+`PISING_LOCAL` in mangle `OUTPUT`: core gid RETURN → own_mark RETURN →
+`ignore_interfaces` RETURN → `PISING_SKIP` (**RETURN**) → DNS MARK → per-app →
+blanket MARK.
+
+Why it must stay this way (each measured — see README):
+
+- `ACCEPT` in PREROUTING bypass, `RETURN` in OUTPUT bypass. Anything else either
+  loops the core's own answers (25k `inbound packet connection` lines for one
+  request) or skips the vendor mangle chains behind us (`qcom_NWMGR`,
+  `oplus_tos_mapping`, `connmark_*`).
+- DNS rules before every bypass, or a private resolver escapes the hijack.
+- The core bypass must be by **gid** (`net_admin`, 3005) — `outbound.routing_mark`
+  alone does not stop the DNS transport from being captured.
+- `ipv6=block` must reject IPv6 DNS, so netd falls back to its IPv4 resolvers whose
+  queries the IPv4 chain hijacks. Passing IPv6 DNS through is a DNS leak
+  (netd talks to `fe80::1%wlan0`, i.e. the router → ISP).
+- `-D` needs the full match spec (`-m socket --transparent`), or `PISING_DIVERT`
+  survives `stop`.
+
+## Testing
+
+Host (this container; kernel has xt_TPROXY, `ip netns` works):
+
+```
+SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
+SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 14/14 expected
+tools/build.sh                                      # smoke + zip in dist/
+```
+
+Device (root through android-bridge):
+
+```
+S=/run/android-bridge/bridge.sock            # may also appear as /run/android-bridge/android-bridge/bridge.sock
+android-bridge -s $S -T su -c 'sh /data/local/tmp/x.sh'
+android-bridge -s $S push ./local-file /data/local/tmp/local-file   # then su cp into /data/adb
+```
+
+A useful device check set (all must hold):
+
+| check | expectation |
+| --- | --- |
+| `curl -s https://1.1.1.1/cdn-cgi/trace` | proxy exit IP, not the carrier IP |
+| `curl -o /dev/null -w '%{remote_ip}' https://www.wikipedia.org` | `198.18.x.x` (fakeip) = DNS goes through sing-box |
+| `curl -sL https://edns.ip-api.com/json` | resolver is the tunnel-side one, not the ISP |
+| `curl -6 https://ipv6.icanhazip.com` | fails |
+| container `curl https://api.ipify.org` | carrier IP (bypassed) |
+
+## Android traps already paid for
+
+- `type: local` DNS servers do not work (`read udp [::1]:53: connection refused`).
+- Remote rule-sets are initialized **before** the endpoint is up: give
+  `http_clients` a `detour` + `domain_resolver`, otherwise
+  `lookup github.com: WireGuard is not ready yet` is fatal.
+- A DNS `detour` may be a selector, never a plain `direct` outbound
+  (`detour to an empty direct outbound makes no sense`).
+- `check` is weaker than `run`: the DNS-detour error above only appears at start.
+- KernelSU's installer does not extract `module.prop` when `SKIPUNZIP=1`.
+- `pidof`/`pgrep`/`ss`/`curl`/`awk`/`sed`/`sort` exist on the target ROM; busybox
+  is at `/data/adb/ksu/bin/busybox` (found by explicit path, not via PATH).
+
+## Release
+
+1. Bump `version` and `versionCode` in `module/module.prop`.
+2. `tools/fetch-sing-box.sh` if the pinned release changed (update
+   `TARBALL_SHA256` too).
+3. `SINGBOX_BIN=... tools/build.sh` → `dist/Pi-Sing-<version>.zip` + sha256.
+4. `SINGBOX_BIN=... tests/netns-tproxy-test.sh` and the device check set above.
+5. Commit subject: `pi-sing: <what changed>`; body explains the measurement, not
+   the intention.

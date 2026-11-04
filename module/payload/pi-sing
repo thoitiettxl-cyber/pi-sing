@@ -1,0 +1,342 @@
+#!/system/bin/sh
+# Pi-Sing control CLI.
+#
+#   pi-sing start | stop | restart | status | log [n] | iptables <arg> | watchdog
+#
+# start  : validate settings and config, run sing-box, then install TPROXY rules
+# stop   : remove TPROXY rules first, then stop sing-box
+# status : process, rule and config summary (also used by action.sh)
+set -u
+
+PISING_DIR="${PISING_DIR:-/data/adb/pi-sing}"
+settings="${PISING_DIR}/settings.ini"
+[ -f "$settings" ] || { printf 'pi-sing: settings not found: %s\n' "$settings" >&2; exit 1; }
+. "$settings"
+
+bin_path="${data_dir}/bin/${bin_name}"
+config_path="${data_dir}/${config_file}"
+run_dir="${data_dir}/run"
+pid_file="${run_dir}/pi-sing.pid"
+log_file="${run_dir}/pi-sing.log"
+mod_dir="/data/adb/modules/pi-sing"
+
+mkdir -p "$run_dir" 2>/dev/null
+
+log() {
+    _lvl="$1"; shift
+    _msg="$(date '+%Y-%m-%d %H:%M:%S') [${_lvl}] $*"
+    printf '%s\n' "$_msg" >> "$log_file" 2>/dev/null
+    printf '%s\n' "$_msg"
+}
+
+# ---------------------------------------------------------------- internals
+
+# busybox is what setuidgid comes from; KernelSU/Magisk/APatch each keep one in
+# a different place and boot services do not always inherit a full PATH.
+find_busybox() {
+    for _b in "$(command -v busybox 2>/dev/null)" \
+              /data/adb/ksu/bin/busybox /data/adb/magisk/busybox \
+              /data/adb/ap/bin/busybox /system/xbin/busybox; do
+        if [ -n "$_b" ] && [ -x "$_b" ]; then
+            printf '%s' "$_b"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_pid() {
+    if command -v pidof >/dev/null 2>&1; then
+        pidof "$bin_name" 2>/dev/null | awk '{ print $1 }'
+    elif command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$bin_path" 2>/dev/null | head -n 1
+    else
+        ps -A 2>/dev/null | awk -v b="$bin_name" '$NF ~ b && $1 != "PID" { print $2; exit }'
+    fi
+}
+
+running_pid() {
+    _pid="$(cat "$pid_file" 2>/dev/null)"
+    if [ -n "${_pid:-}" ] && kill -0 "$_pid" 2>/dev/null; then
+        printf '%s' "$_pid"
+        return 0
+    fi
+    find_pid
+}
+
+update_desc() {
+    [ -f "$mod_dir/module.prop" ] || return 0
+    _time="$(date '+%H:%M')"
+    sed -i "s#^description=.*#description=[ ${_time} | $1 ] sing-box + TPROXY (${proxy_mode}, port ${tproxy_port})#" "$mod_dir/module.prop" 2>/dev/null
+    return 0
+}
+
+# Keep the log from growing forever on a phone that never reboots.
+rotate_log() {
+    [ -f "$log_file" ] || return 0
+    _size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+    if [ "${_size:-0}" -gt 1048576 ]; then
+        mv -f "$log_file" "${log_file}.1" 2>/dev/null
+        : > "$log_file" 2>/dev/null
+        log Info "log rotated (${_size} bytes)"
+    fi
+    return 0
+}
+
+http_probe() {  # $1 = url, $2 = optional command prefix ("busybox setuidgid 0:3005")
+    _url="$1"
+    _wrap="${2:-}"
+    if command -v curl >/dev/null 2>&1; then
+        _cmd="curl -s -m 10 -o /dev/null $_url"
+    else
+        _cmd="wget -q -O /dev/null -T 10 $_url"
+    fi
+    # shellcheck disable=SC2086
+    $_wrap $_cmd >/dev/null 2>&1
+}
+
+# Two probes: one from a socket exempted by the rules (direct) and one that the
+# rules must capture (proxied). If direct works but proxied does not, the tunnel
+# is down and the rules stay (fail closed, no leak). If both fail, the rules
+# themselves are broken and are removed so the phone keeps its connection.
+selftest() {
+    [ "${selftest:-0}" = "1" ] || return 0
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        log Warn "selftest skipped: no curl/wget on the device"
+        return 0
+    fi
+    _bb="$(find_busybox)"
+    _gid="$(cat "${run_dir}/core.gid" 2>/dev/null)"
+    _direct=""
+    if [ -n "${_gid:-}" ] && [ -n "${_bb:-}" ]; then
+        http_probe https://1.1.1.1/cdn-cgi/trace "$_bb setuidgid 0:$_gid" && _direct=1
+    else
+        http_probe https://1.1.1.1/cdn-cgi/trace && _direct=1
+    fi
+    if [ -n "$_direct" ]; then
+        log Info "selftest: direct path ok"
+    else
+        log Warn "selftest: direct path failed (no internet before the rules?)"
+    fi
+    sleep 1
+    if http_probe https://1.1.1.1/cdn-cgi/trace; then
+        log Info "selftest: proxied path ok"
+        return 0
+    fi
+    if [ -n "$_direct" ]; then
+        log Warn "selftest: proxied path failed, tunnel is probably down (rules kept, fail closed)"
+        update_desc "tunnel down"
+        return 1
+    fi
+    log Error "selftest: both paths failed, removing the rules to keep the phone online"
+    do_off
+    update_desc "rules removed by selftest"
+    return 1
+}
+
+launch() {
+    if command -v nohup >/dev/null 2>&1; then
+        if command -v setsid >/dev/null 2>&1; then
+            nohup setsid "$@" >> "$log_file" 2>&1 &
+        else
+            nohup "$@" >> "$log_file" 2>&1 &
+        fi
+    elif command -v setsid >/dev/null 2>&1; then
+        setsid "$@" >> "$log_file" 2>&1 &
+    else
+        "$@" >> "$log_file" 2>&1 &
+    fi
+}
+
+# settings.ini owns tproxy_port: rewrite only the tproxy inbound object so
+# other inbounds (mixed/http/socks) keep their own port.
+sync_config() {
+    [ -f "$config_path" ] || { log Error "config not found: $config_path"; return 1; }
+    _tmp="${run_dir}/config.sync.tmp"
+    awk -v port="$tproxy_port" '
+        { line[NR] = $0 }
+        /"inbounds"[[:space:]]*:/ { inb = 1; obj = 0; nobj = 0 }
+        inb {
+            if ($0 ~ /\{/ && obj == 0) obj = NR
+            if ($0 ~ /\}/ && obj > 0) { objs[++nobj] = obj " " NR; obj = 0 }
+            if ($0 ~ /^[[:space:]]*\][[:space:]]*,?[[:space:]]*$/) inb = 0
+        }
+        END {
+            for (i = 1; i <= nobj; i++) {
+                split(objs[i], r, " ")
+                istp = 0
+                for (j = r[1]; j <= r[2]; j++)
+                    if (line[j] ~ /"type"[[:space:]]*:[[:space:]]*"[a-z-]*tproxy"/) istp = 1
+                if (istp)
+                    for (j = r[1]; j <= r[2]; j++) tp[j] = 1
+            }
+            for (i = 1; i <= NR; i++) {
+                if (tp[i] && line[i] ~ /"listen_port"[[:space:]]*:/)
+                    sub(/:[[:space:]]*[0-9]+/, ": " port, line[i])
+                print line[i]
+            }
+        }' "$config_path" > "$_tmp" 2>/dev/null && [ -s "$_tmp" ] && mv -f "$_tmp" "$config_path"
+
+    if ! grep -q '"type": *"[a-z-]*tproxy"' "$config_path"; then
+        log Warn "no tproxy inbound in ${config_path}: this module only works with a tproxy inbound"
+        return 0
+    fi
+    # optional second loop guard: sing-box sets SO_MARK on its own outbound sockets
+    sed -i "s/\(\"routing_mark\"[[:space:]]*:[[:space:]]*\)[0-9]\+/\1${routing_mark}/g" "$config_path"
+    return 0
+}
+
+# sing-box validates the config (schema + rule sets) before we touch any rule.
+check_config() {
+    "$bin_path" check -D "$data_dir" -c "$config_path" >> "$log_file" 2>&1
+}
+
+# Start the core as ${core_user}:${core_group} so pi.iptables can bypass it by
+# gid. Without that the core's own outbound traffic (DNS first) matches the
+# proxy rules again and loops. Falls back to a uid 0 bypass.
+start_core() {
+    if [ -n "${core_group:-}" ] && [ -n "${core_gid:-}" ]; then
+        _bb="$(find_busybox)"
+        if [ -n "${_bb:-}" ] &&
+           [ "$("$_bb" id -g "$core_group" 2>/dev/null)" = "$core_gid" ]; then
+            printf '%s\n' "$core_gid" > "${run_dir}/core.gid"
+            log Info "core runs as ${core_user}:${core_group} (gid ${core_gid}) via ${_bb}"
+            launch "$_bb" setuidgid "${core_user}:${core_group}" "$@"
+            return 0
+        fi
+        if command -v setpriv >/dev/null 2>&1 &&
+           setpriv --reuid=0 --regid="$core_gid" --clear-groups true 2>/dev/null; then
+            printf '%s\n' "$core_gid" > "${run_dir}/core.gid"
+            log Info "core runs as 0:${core_gid} via setpriv"
+            launch setpriv --reuid=0 --regid="$core_gid" --clear-groups "$@"
+            return 0
+        fi
+    fi
+    rm -f "${run_dir}/core.gid"
+    log Warn "cannot set group ${core_group:-net_admin}: core runs as root, root traffic bypasses the proxy (uid 0)"
+    launch "$@"
+}
+
+# ----------------------------------------------------------------- actions
+
+do_start() {
+    if [ ! -x "$bin_path" ]; then
+        log Error "sing-box binary missing or not executable: $bin_path"
+        return 1
+    fi
+    _running="$(running_pid)"
+    if [ -n "${_running:-}" ]; then
+        printf '%s\n' "$_running" > "$pid_file"
+        log Info "already running (pid ${_running})"
+        return 0
+    fi
+    sync_config || return 1
+    if ! check_config; then
+        log Error "sing-box check failed, see ${log_file}"
+        update_desc "config error"
+        return 1
+    fi
+    rotate_log
+    printf '\n==== %s start ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$log_file"
+    start_core "$bin_path" run -D "$data_dir" -c "$config_path"
+    sleep 2
+    _pid="$(find_pid)"
+    if [ -z "${_pid:-}" ]; then
+        log Error "sing-box exited, see ${log_file}"
+        update_desc "failed to start"
+        return 1
+    fi
+    printf '%s\n' "$_pid" > "$pid_file"
+    log Info "sing-box running (pid ${_pid})"
+    "${data_dir}/pi.iptables" on >> "$log_file" 2>&1 || {
+        log Error "failed to install TPROXY rules"
+        update_desc "rules error"
+        return 1
+    }
+    update_desc "running pid ${_pid}"
+    selftest || return 1
+    return 0
+}
+
+do_stop() {
+    "${data_dir}/pi.iptables" off >> "$log_file" 2>&1
+    _pid="$(running_pid)"
+    if [ -n "${_pid:-}" ]; then
+        kill -15 "$_pid" 2>/dev/null
+        _n=0
+        while [ "$_n" -lt 20 ] && kill -0 "$_pid" 2>/dev/null; do
+            sleep 0.5
+            _n=$((_n + 1))
+        done
+        kill -0 "$_pid" 2>/dev/null && kill -9 "$_pid" 2>/dev/null
+        log Info "sing-box stopped (pid ${_pid})"
+    else
+        log Info "sing-box is not running"
+    fi
+    rm -f "$pid_file" "${run_dir}/core.gid"
+    update_desc "idle"
+    return 0
+}
+
+do_status() {
+    _pid="$(running_pid)"
+    _ver="$("$bin_path" version 2>/dev/null | head -n 1)"
+    printf 'pi-sing    : %s\n' "${_ver:-unknown}"
+    printf 'settings   : %s (mode=%s, port=%s, ipv6=%s, quic=%s)\n' \
+        "$settings" "$proxy_mode" "$tproxy_port" "$ipv6" "$quic"
+    printf 'config     : %s\n' "$config_path"
+    if [ -n "${_pid:-}" ]; then
+        printf 'process    : running (pid %s, %s)\n' "$_pid" \
+            "$(ps -o etime= -p "$_pid" 2>/dev/null | tr -d ' ')"
+    else
+        printf 'process    : stopped\n'
+    fi
+    _rules="$(ip rule show 2>/dev/null | grep -cF "lookup ${table}")"
+    printf 'rules      : %s ip rule entr(ies) for table %s\n' "${_rules:-0}" "$table"
+    iptables -t mangle -S OUTPUT 2>/dev/null | grep -qF PISING_LOCAL &&
+        printf 'iptables   : hooked into mangle OUTPUT/PREROUTING\n' ||
+        printf 'iptables   : not hooked\n'
+    printf 'logs       : %s\n' "$log_file"
+    return 0
+}
+
+do_log() {
+    _lines="${1:-40}"
+    tail -n "$_lines" "$log_file" 2>/dev/null || printf '(no log yet)\n'
+    return 0
+}
+
+do_watchdog() {
+    [ "$watchdog" = "1" ] || { log Info "watchdog disabled"; return 0; }
+    log Info "watchdog started (${watchdog_interval}s)"
+    _iface=""
+    while :; do
+        sleep "$watchdog_interval"
+        if [ -z "$(running_pid)" ]; then
+            log Warn "sing-box is gone, restarting"
+            do_start || sleep 30
+        fi
+        _cur="$(ip route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+        if [ -n "$_cur" ] && [ "$_cur" != "$_iface" ]; then
+            if [ -n "$_iface" ]; then
+                log Info "default interface ${_iface} -> ${_cur}, renewing rules"
+                "${data_dir}/pi.iptables" renew >> "$log_file" 2>&1
+            fi
+            _iface="$_cur"
+        fi
+    done
+}
+
+case "${1:-}" in
+    start)    do_start ;;
+    stop)     do_stop ;;
+    restart)  do_stop; do_start ;;
+    status)   do_status ;;
+    log)      shift; do_log "${1:-40}" ;;
+    iptables) shift; "${data_dir}/pi.iptables" "${1:-status}" ;;
+    watchdog) do_watchdog ;;
+    *)
+        printf 'usage: %s {start|stop|restart|status|log [n]|iptables <on|off|renew|status>|watchdog}\n' "$0" >&2
+        exit 1
+        ;;
+esac

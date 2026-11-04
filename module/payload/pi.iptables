@@ -1,0 +1,402 @@
+#!/system/bin/sh
+# Pi-Sing -- transparent proxy (TPROXY) rules for a single sing-box tproxy inbound.
+#
+#   pi.iptables on|renew     install rules (IPv4, plus IPv6 in ipv6=proxy)
+#   pi.iptables off          remove every rule installed by this script
+#   pi.iptables status       show what is currently installed
+#   pi.iptables watchdog-... (not here, see pi-sing)
+#
+# Design (measured on the target device, OnePlus CPH2747 / Android 17 / kernel 6.12):
+#  * mangle PREROUTING is empty on Android, so bypass there uses ACCEPT. mangle
+#    OUTPUT carries vendor chains (qcom_NWMGR, oplus_tos_mapping, connmark_*),
+#    so bypass there must use RETURN and never ACCEPT.
+#  * DNS (port 53 tcp+udp) is TPROXY'd to the same inbound and answered by the
+#    sing-box route rule {"protocol":"dns","action":"hijack-dns"}; the rule sits
+#    before every bypass so a private resolver is hijacked too.
+#  * Locally generated traffic is marked in mangle OUTPUT and delivered to the
+#    tproxy socket through `ip rule fwmark ... table <table>` + a local route to
+#    lo, then re-enters PREROUTING on lo.
+#  * Loop protection: the core runs with a dedicated gid (net_admin = 3005) and
+#    mangle OUTPUT returns on that gid; SO_MARK (own_mark) is a second guard.
+#  * ipv6=proxy installs the same rule set with ip6tables (+ `ip -6 rule/route`),
+#    ipv6=block leaves IPv6 unproxied but rejects it, so it cannot leak,
+#    ipv6=off does nothing (IPv6 goes direct: a leak).
+set -u
+
+PISING_DIR="${PISING_DIR:-/data/adb/pi-sing}"
+settings="${PISING_DIR}/settings.ini"
+run_dir="${PISING_DIR}/run"
+log_file="${run_dir}/iptables.log"
+
+[ -f "$settings" ] || { printf 'pi.iptables: settings not found: %s\n' "$settings" >&2; exit 1; }
+. "$settings"
+
+mkdir -p "$run_dir" 2>/dev/null
+
+log() {
+    _lvl="$1"; shift
+    _msg="$(date '+%Y-%m-%d %H:%M:%S') [${_lvl}] $*"
+    printf '%s\n' "$_msg" >> "$log_file" 2>/dev/null
+    printf '%s\n' "$_msg"
+}
+
+# Android 11+ ships iptables 1.8, which takes the xtables lock; -w waits for it.
+IPT_WAIT=""
+if iptables -w 100 -t mangle -S >/dev/null 2>&1; then
+    IPT_WAIT="-w 100"
+fi
+
+i4() { iptables $IPT_WAIT "$@"; }
+i6() { ip6tables $IPT_WAIT "$@"; }
+
+c_ext="PISING_EXT"      # PREROUTING, capture
+c_local="PISING_LOCAL"  # OUTPUT, mark
+c_divert="PISING_DIVERT" # PREROUTING, already handled sockets
+c_bypass="PISING_BYPASS" # PREROUTING, ACCEPT private/local destinations
+c_skip="PISING_SKIP"    # OUTPUT, RETURN private/local destinations
+c_guard="PISING_GUARD"  # filter OUTPUT, reject direct tproxy port and QUIC
+c_v6="PISING_V6BLOCK"   # filter OUTPUT/FORWARD, reject IPv6 in ipv6=block
+
+# 198.18.0.0/15 and fc00::/18 are deliberately absent: sing-box fakeip uses
+# those ranges and traffic to a fake address must be proxied, not bypassed.
+intranet4="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
+intranet6="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 2001:db8::/32 fe80::/10 ff00::/8"
+
+packages_list_file="/data/system/packages.list"
+
+# ------------------------------------------------------------------ helpers
+
+local_addrs() {
+    case "$1" in
+        6) ip -6 -o addr show 2>/dev/null | awk '{ print $4 }' | grep -vE '^(fe80|::1/)' ;;
+        *) ip -4 -o addr show 2>/dev/null | awk '{ if ($2 != "lo") print $4 }' ;;
+    esac
+}
+
+# Resolve package.list.cfg entries to uids in ${uid_file}.
+read_uid_list() {
+    : > "$uid_file" 2>/dev/null
+    pkg_cfg="${PISING_DIR}/package.list.cfg"
+    [ -f "$pkg_cfg" ] || return 0
+    entries="$(awk '
+        function trim(s) { gsub(/^[ \t\r]+/, "", s); gsub(/[ \t\r]+$/, "", s); return s }
+        /^[ \t]*#/ { next }
+        {
+            sub(/[ \t]*#.*/, "", $0)
+            line = trim($0)
+            if (line == "") next
+            if (line ~ /^mode:/) next
+            print line
+        }' "$pkg_cfg")"
+    [ -n "$entries" ] || return 0
+
+    printf '%s\n' "$entries" | while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        case "$entry" in
+            *[!0-9]*)
+                case "$entry" in
+                    *:*) user="${entry%%:*}"; pkg="${entry#*:}" ;;
+                    *)   user=0; pkg="$entry" ;;
+                esac
+                case "$user" in *[!0-9]*|"") user=0 ;; esac
+                appid="$(awk -v p="$pkg" '$1 == p { print $2; exit }' "$packages_list_file" 2>/dev/null)"
+                if [ -n "${appid:-}" ]; then
+                    printf '%s\n' "$((user * 100000 + appid))" >> "$uid_file"
+                else
+                    log Warn "uid not found for ${pkg} (user ${user}), skipped"
+                fi
+                ;;
+            *)
+                printf '%s\n' "$entry" >> "$uid_file"
+                ;;
+        esac
+    done
+    return 0
+}
+
+read_ap_list() {
+    : > "${run_dir}/ap.list" 2>/dev/null
+    cfg="${PISING_DIR}/ap.list.cfg"
+    [ -f "$cfg" ] || return 0
+    awk '/^[ \t]*allow[ \t]+/ { print $2 }' "$cfg" >> "${run_dir}/ap.list"
+    return 0
+}
+
+# Delete every occurrence of a rule (max 5) so `on` is idempotent.
+del_all() {
+    _ipt="$1"; shift
+    _n=0
+    while [ "$_n" -lt 5 ] && $_ipt "$@" >/dev/null 2>&1; do
+        _n=$((_n + 1))
+    done
+}
+
+# --------------------------------------------------------------- rule setup
+
+# $1 = i4|i6, $2 = chain, $3 = list, $4 = verdict (ACCEPT|RETURN)
+build_skip() {
+    _ipt="$1"; _chain="$2"; _list="$3"; _verdict="$4"
+    for _cidr in $_list; do
+        $_ipt -t mangle -A "$_chain" -d "$_cidr" -j "$_verdict"
+    done
+}
+
+build_ext() {
+    _ipt="$1"
+    _dns_only="${2:-no}"
+    if [ "$_dns_only" != no ]; then
+        # ipv6=block: only DNS is captured, everything else stays rejected.
+        $_ipt -t mangle -A "$c_ext" -p tcp --dport 53 -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$fwmark"
+        $_ipt -t mangle -A "$c_ext" -p udp --dport 53 -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$fwmark"
+        return 0
+    fi
+    # 1. interfaces that must never be touched (containers, VM bridges, dummy).
+    for _if in $bypass_interfaces; do
+        $_ipt -t mangle -A "$c_ext" -i "$_if" -j ACCEPT
+    done
+    # 2. DNS hijack before any bypass, so a private resolver is hijacked too.
+    $_ipt -t mangle -A "$c_ext" -p tcp --dport 53 -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$fwmark"
+    $_ipt -t mangle -A "$c_ext" -p udp --dport 53 -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$fwmark"
+    # 3. private / device-local destinations leave the hook (ACCEPT: mangle
+    #    PREROUTING is otherwise empty on Android).
+    $_ipt -t mangle -A "$c_ext" -j "$c_bypass"
+    # 4. traffic re-entering through lo is locally generated, already marked.
+    $_ipt -t mangle -A "$c_ext" -p tcp -i lo -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$fwmark"
+    $_ipt -t mangle -A "$c_ext" -p udp -i lo -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$fwmark"
+    # 5. hotspot / tether clients.
+    if [ -s "${run_dir}/ap.list" ]; then
+        while IFS= read -r ap; do
+            [ -n "$ap" ] || continue
+            $_ipt -t mangle -A "$c_ext" -p tcp -i "$ap" -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$fwmark" 2>/dev/null ||
+                log Warn "iface ${ap} not available yet, skipped"
+            $_ipt -t mangle -A "$c_ext" -p udp -i "$ap" -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$fwmark" 2>/dev/null ||
+                log Warn "iface ${ap} not available yet, skipped"
+        done < "${run_dir}/ap.list"
+    fi
+}
+
+build_local() {
+    _ipt="$1"
+    _dns_only="${2:-no}"
+    # 1. the core itself, by gid when pi-sing could set one, else by uid 0.
+    _core_gid="$(cat "${run_dir}/core.gid" 2>/dev/null)"
+    if [ -n "${_core_gid:-}" ]; then
+        $_ipt -t mangle -A "$c_local" -m owner --gid-owner "$_core_gid" -j RETURN
+    else
+        $_ipt -t mangle -A "$c_local" -m owner --uid-owner 0 -j RETURN
+    fi
+    # 2. second guard: SO_MARK set by the core's own outbound sockets.
+    $_ipt -t mangle -A "$c_local" -m mark --mark "$own_mark" -j RETURN
+    if [ "$_dns_only" != no ]; then
+        # ipv6=block: mark DNS only, so it is hijacked like the IPv4 one. The
+        # phone resolves names through netd, which talks plain DNS to a
+        # link-local resolver (measured: fe80::1%wlan0), so this path matters.
+        $_ipt -t mangle -A "$c_local" -p tcp --dport 53 -j MARK --set-xmark "$fwmark"
+        $_ipt -t mangle -A "$c_local" -p udp --dport 53 -j MARK --set-xmark "$fwmark"
+        return 0
+    fi
+    # 3. interfaces excluded from proxying.
+    for _if in $ignore_interfaces; do
+        $_ipt -t mangle -A "$c_local" -o "$_if" -j RETURN
+    done
+    # 4. private / device-local destinations: RETURN, never ACCEPT (the vendor
+    #    chains behind us in mangle OUTPUT must still run).
+    $_ipt -t mangle -A "$c_local" -j "$c_skip"
+    # 5. DNS is hijacked for every app, in both blacklist and whitelist mode.
+    $_ipt -t mangle -A "$c_local" -p tcp --dport 53 -j MARK --set-xmark "$fwmark"
+    $_ipt -t mangle -A "$c_local" -p udp --dport 53 -j MARK --set-xmark "$fwmark"
+    # 6. per-app selection.
+    _uids=""
+    [ -f "$uid_file" ] && _uids="$(sort -u "$uid_file" 2>/dev/null)"
+    case "$proxy_mode" in
+        white|whitelist)
+            for _uid in $_uids; do
+                $_ipt -t mangle -A "$c_local" -p tcp -m owner --uid-owner "$_uid" -j MARK --set-xmark "$fwmark"
+                $_ipt -t mangle -A "$c_local" -p udp -m owner --uid-owner "$_uid" -j MARK --set-xmark "$fwmark"
+            done
+            # unlisted apps stay direct
+            ;;
+        *)
+            for _uid in $_uids; do
+                $_ipt -t mangle -A "$c_local" -m owner --uid-owner "$_uid" -j RETURN
+            done
+            $_ipt -t mangle -A "$c_local" -p tcp -j MARK --set-xmark "$fwmark"
+            $_ipt -t mangle -A "$c_local" -p udp -j MARK --set-xmark "$fwmark"
+            ;;
+    esac
+}
+
+build_guard() {
+    _ipt="$1"
+    # QUIC: block UDP 443/80 so applications fall back to TCP.
+    if [ "$quic" = "disable" ]; then
+        $_ipt -t filter -A "$c_guard" -p udp --dport 443 -j REJECT
+        $_ipt -t filter -A "$c_guard" -p udp --dport 80 -j REJECT
+    fi
+    # Nothing may connect to the tproxy port directly (loop prevention).
+    case "$_ipt" in
+        i6) $_ipt -t filter -A "$c_guard" -d ::1 -p tcp --dport "$tproxy_port" -j REJECT ;;
+        *)  $_ipt -t filter -A "$c_guard" -d 127.0.0.1 -p tcp --dport "$tproxy_port" -j REJECT ;;
+    esac
+}
+
+apply_proto() {
+    _ipt="$1"            # i4 | i6
+    _fam="$2"            # 4 | 6
+    _ipcmd="ip"
+    [ "$_fam" = 6 ] && _ipcmd="ip -6"
+
+    $_ipcmd rule add fwmark "$fwmark" table "$table" pref "$pref" 2>/dev/null
+    $_ipcmd route replace local default dev lo table "$table" 2>/dev/null ||
+        log Error "cannot add local default route to table ${table}"
+
+    for _c in "$c_ext" "$c_local" "$c_divert" "$c_bypass" "$c_skip"; do
+        $_ipt -t mangle -N "$_c" 2>/dev/null
+        $_ipt -t mangle -F "$_c" 2>/dev/null
+    done
+    $_ipt -t filter -N "$c_guard" 2>/dev/null
+    $_ipt -t filter -F "$c_guard" 2>/dev/null
+
+    if [ "$_fam" = 6 ]; then
+        build_skip "$_ipt" "$c_bypass" "$intranet6 $(local_addrs 6)" ACCEPT
+        build_skip "$_ipt" "$c_skip" "$intranet6 $(local_addrs 6)" RETURN
+    else
+        build_skip "$_ipt" "$c_bypass" "$intranet4 $(local_addrs 4)" ACCEPT
+        build_skip "$_ipt" "$c_skip" "$intranet4 $(local_addrs 4)" RETURN
+    fi
+    build_ext "$_ipt" "${3:-no}"
+    build_local "$_ipt" "${3:-no}"
+    build_guard "$_ipt"
+
+    # Already-handled socket (established tproxy connection): mark and accept.
+    $_ipt -t mangle -A "$c_divert" -j MARK --set-xmark "$fwmark"
+    $_ipt -t mangle -A "$c_divert" -j ACCEPT
+
+    $_ipt -t mangle -I PREROUTING -j "$c_ext"
+    if $_ipt -t mangle -I PREROUTING -p tcp -m socket --transparent -j "$c_divert" 2>/dev/null; then
+        :
+    else
+        log Warn "xt_socket mangle PREROUTING unsupported, skipping DIVERT"
+    fi
+    $_ipt -t mangle -I OUTPUT -j "$c_local"
+    $_ipt -t filter -I OUTPUT -j "$c_guard"
+    return 0
+}
+
+# ipv6=block: IPv6 is not proxied, so it must not reach the network either.
+apply_v6_block() {
+    i6 -t filter -N "$c_v6" 2>/dev/null
+    i6 -t filter -F "$c_v6" 2>/dev/null
+    # DNS over IPv6 is rejected, not passed: netd would otherwise resolve over
+    # fe80::1%wlan0 (the LAN router -> ISP resolver), which is an unproxied DNS
+    # leak, and the marked link-local packet does not survive the reroute to lo.
+    # Rejecting it makes netd fall back to its IPv4 resolvers, whose queries our
+    # IPv4 mangle chain hijacks into sing-box.
+    i6 -t filter -A "$c_v6" -p udp --dport 53 -j REJECT
+    i6 -t filter -A "$c_v6" -p tcp --dport 53 -j REJECT --reject-with tcp-reset
+    i6 -t filter -A "$c_v6" -d fe80::/10 -j RETURN
+    i6 -t filter -A "$c_v6" -d ff00::/8 -j RETURN
+    i6 -t filter -A "$c_v6" -j REJECT
+    i6 -t filter -I OUTPUT -j "$c_v6"
+    i6 -t filter -I FORWARD -j "$c_v6"
+    log Info "ipv6=block: IPv6 rejected (DNS forced to the hijacked IPv4 path)"
+}
+
+teardown_proto() {
+    _ipt="$1"
+    _fam="$2"
+    _ipcmd="ip"
+    [ "$_fam" = 6 ] && _ipcmd="ip -6"
+
+    del_all "$_ipt" -t mangle -D PREROUTING -j "$c_ext"
+    # the match spec must be identical to the inserted rule or -D does not match
+    del_all "$_ipt" -t mangle -D PREROUTING -p tcp -m socket --transparent -j "$c_divert"
+    del_all "$_ipt" -t mangle -D OUTPUT -j "$c_local"
+    del_all "$_ipt" -t filter -D OUTPUT -j "$c_guard"
+    del_all "$_ipt" -t filter -D OUTPUT -j "$c_v6"
+    del_all "$_ipt" -t filter -D FORWARD -j "$c_v6"
+
+    for _c in "$c_ext" "$c_local" "$c_divert" "$c_bypass" "$c_skip"; do
+        $_ipt -t mangle -F "$_c" 2>/dev/null
+        $_ipt -t mangle -X "$_c" 2>/dev/null
+    done
+    for _c in "$c_guard" "$c_v6"; do
+        $_ipt -t filter -F "$_c" 2>/dev/null
+        $_ipt -t filter -X "$_c" 2>/dev/null
+    done
+
+    _n=0
+    while [ "$_n" -lt 5 ] && $_ipcmd rule del fwmark "$fwmark" table "$table" pref "$pref" 2>/dev/null; do
+        _n=$((_n + 1))
+    done
+    $_ipcmd route flush table "$table" 2>/dev/null
+    return 0
+}
+
+# ------------------------------------------------------------------ actions
+
+ipv6_mode() {
+    case "${ipv6:-off}" in
+        true|1|proxy) echo proxy ;;
+        false|0|block) echo block ;;
+        *) echo off ;;
+    esac
+}
+
+do_on() {
+    command -v iptables >/dev/null 2>&1 || { log Error "iptables not found"; return 1; }
+    command -v ip >/dev/null 2>&1 || { log Error "ip not found"; return 1; }
+    iptables $IPT_WAIT -t mangle -S >/dev/null 2>&1 || { log Error "mangle table unavailable"; return 1; }
+    read_uid_list
+    read_ap_list
+    do_off >/dev/null 2>&1
+
+    log Info "installing TPROXY rules"
+    apply_proto i4 4
+    case "$(ipv6_mode)" in
+        proxy)
+            apply_proto i6 6
+            log Info "ipv6=proxy: IPv6 rules installed"
+            ;;
+        block) apply_v6_block ;;
+        *) log Warn "ipv6=off: IPv6 traffic is NOT proxied and can leak" ;;
+    esac
+    _bypass="${bypass_interfaces:-none}"
+    log Info "tproxy ${tproxy_port}/tcp+udp, fwmark ${fwmark}, table ${table}, pref ${pref}, mode ${proxy_mode}"
+    log Info "bypass interfaces: ${_bypass}"
+    return 0
+}
+
+do_off() {
+    teardown_proto i4 4
+    teardown_proto i6 6
+    log Info "TPROXY rules removed"
+    return 0
+}
+
+do_status() {
+    printf '== ip rule (v4)\n'
+    ip rule show 2>/dev/null | grep -F "lookup ${table}" || printf '(none)\n'
+    printf '== ip rule (v6)\n'
+    ip -6 rule show 2>/dev/null | grep -F "lookup ${table}" || printf '(none)\n'
+    printf '== route table %s\n' "$table"
+    ip route show table "$table" 2>/dev/null || printf '(none)\n'
+    printf '== mangle hooks\n'
+    i4 -t mangle -S PREROUTING 2>/dev/null | grep -F PISING || printf '(v4 prerouting none)\n'
+    i4 -t mangle -S OUTPUT 2>/dev/null | grep -F PISING || printf '(v4 output none)\n'
+    i6 -t mangle -S PREROUTING 2>/dev/null | grep -F PISING || printf '(v6 none)\n'
+    printf '== ipv6 mode: %s\n' "$(ipv6_mode)"
+    printf '== PISING_LOCAL counters\n'
+    i4 -t mangle -L "$c_local" -n -v 2>/dev/null || printf '(none)\n'
+    return 0
+}
+
+case "${1:-}" in
+    on|enable|renew) do_on ;;
+    off|disable)     do_off ;;
+    status)          do_status ;;
+    *)
+        printf 'usage: %s {on|off|renew|status}\n' "$0" >&2
+        exit 1
+        ;;
+esac

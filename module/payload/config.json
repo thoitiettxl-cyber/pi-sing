@@ -1,0 +1,265 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "remote_dns",
+        "server": "8.8.8.8",
+        "detour": "Default_🦈"
+      },
+      {
+        "type": "fakeip",
+        "tag": "fake_dns",
+        "inet4_range": "198.18.0.0/15"
+      },
+      {
+        "type": "udp",
+        "tag": "dns-bootstrap",
+        "server": "8.8.8.8"
+      }
+    ],
+    "rules": [
+      {
+        "domain": "mdp-appconf-row.heytapdl.com",
+        "action": "predefined",
+        "rcode": "NXDOMAIN"
+      },
+      {
+        "query_type": [
+          "SVCB",
+          "HTTPS"
+        ],
+        "action": "predefined",
+        "rcode": "NOTIMP"
+      },
+      {
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          {
+            "clash_mode": "AllowAds",
+            "invert": true
+          },
+          {
+            "rule_set": "category-ads-all"
+          }
+        ],
+        "action": "predefined",
+        "rcode": "NXDOMAIN"
+      },
+      {
+        "rule_set": "geosite-telegram",
+        "server": "remote_dns"
+      },
+      {
+        "domain_suffix": [
+          ".vertexaisearch.cloud.google.com",
+          ".cloud.google.com",
+          ".googleapis.com",
+          "vertexaisearch.cloud.google.com"
+        ],
+        "server": "remote_dns"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "fake_dns",
+        "rewrite_ttl": 60
+      }
+    ],
+    "final": "remote_dns",
+    "strategy": "ipv4_only"
+  },
+  "http_clients": [
+    {
+      "tag": "direct-http",
+      "version": 2,
+      "detour": "Direct_🦈",
+      "domain_resolver": "dns-bootstrap"
+    }
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "wg-out",
+      "address": "10.2.0.2/32",
+      "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "peers": [
+        {
+          "address": "203.0.113.10",
+          "port": 51820,
+          "public_key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+          "allowed_ips": [
+            "0.0.0.0/0",
+            "::/0"
+          ],
+          "persistent_keepalive_interval": 25
+        }
+      ],
+      "inet4_bind_address": "0.0.0.0"
+    }
+  ],
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7080
+    },
+    {
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "::",
+      "listen_port": 1536,
+      "udp_timeout": "1m0s"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "Default_🦈",
+      "outbounds": [
+        "wg-out",
+        "Direct_🦈"
+      ],
+      "default": "wg-out",
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "direct",
+      "tag": "Direct_🦈"
+    },
+    {
+      "type": "selector",
+      "tag": "Soul_🌐",
+      "outbounds": [
+        "wg-out"
+      ],
+      "default": "wg-out",
+      "interrupt_exist_connections": true
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "port": 53
+          },
+          {
+            "protocol": "dns"
+          }
+        ],
+        "action": "hijack-dns"
+      },
+      {
+        "port": 853,
+        "action": "reject"
+      },
+      {
+        "network": "udp",
+        "port": 443,
+        "action": "reject"
+      },
+      {
+        "action": "sniff",
+        "timeout": "100ms"
+      },
+      {
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          {
+            "clash_mode": "AllowAds",
+            "invert": true
+          },
+          {
+            "rule_set": "category-ads-all"
+          }
+        ],
+        "action": "reject"
+      },
+      {
+        "protocol": "stun",
+        "action": "reject"
+      },
+      {
+        "package_name": [
+          "com.facebook.aura",
+          "mark.via.gp55",
+          "mark.via.gxr"
+        ],
+        "outbound": "Soul_🌐"
+      },
+      {
+        "network": "icmp",
+        "outbound": "Direct_🦈"
+      },
+      {
+        "domain_suffix": [
+          ".vertexaisearch.cloud.google.com",
+          ".cloud.google.com",
+          ".googleapis.com",
+          "vertexaisearch.cloud.google.com"
+        ],
+        "outbound": "Default_🦈"
+      },
+      {
+        "network": [
+          "tcp",
+          "udp"
+        ],
+        "outbound": "Default_🦈"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "category-ads-all",
+        "url": "https://github.com/thaomaitam/Geosite-vn/raw/rule-set/Geosite-vn.srs",
+        "http_client": "direct-http",
+        "update_interval": "24h0m0s"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-telegram",
+        "url": "https://github.com/MetaCubeX/meta-rules-dat/raw/sing/geo-lite/geosite/telegram.srs",
+        "http_client": "direct-http",
+        "update_interval": "24h0m0s"
+      }
+    ],
+    "final": "Default_🦈",
+    "find_process": true,
+    "auto_detect_interface": true,
+    "default_domain_resolver": "remote_dns",
+    "default_http_client": "direct-http"
+  },
+  "services": [
+    {
+      "type": "api",
+      "listen": "127.0.0.1",
+      "listen_port": 9091,
+      "dashboard": "ui"
+    }
+  ],
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db",
+      "store_fakeip": true,
+      "store_dns": true
+    },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "default_mode": "rule"
+    }
+  }
+}

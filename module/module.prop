@@ -1,0 +1,6 @@
+id=pi-sing
+name=Pi-Sing
+version=v1.0.0
+versionCode=20251104
+author=Pi
+description=[ idle ] sing-box + TPROXY transparent proxy (TCP/UDP), no TUN

@@ -1,0 +1,4 @@
+dist/
+module/payload/bin/sing-box
+module/payload/bin/.cache
+*.bak
