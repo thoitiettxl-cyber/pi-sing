@@ -21,16 +21,34 @@ settings="${PISING_DIR}/settings.ini"
 bin_path="${bin_dir}/${bin_name}"
 config_path="${config_dir}/${config_file}"
 pid_file="${run_dir}/pi-sing.pid"
-log_file="${run_dir}/pi-sing.log"
-mod_dir="/data/adb/modules/pi-sing"
+# Written by `stop`, removed by `start`: the watchdog uses it to tell a user
+# stop from a crash. Without it, the action button's OFF was undone 30 s later.
+state_file="${run_dir}/stopped"
+# log_dir comes from settings.ini; defaulted here for a settings file written by
+# v1.3.0, which has no log_dir line.
+log_dir="${log_dir:-${run_dir}/log}"
+module_log="${log_dir}/module.log"
+core_log="${log_dir}/sing-box.log"
+mod_dir="${PISING_MOD_DIR:-/data/adb/modules/pi-sing}"
+TAB="$(printf '\t')"
 
-mkdir -p "$run_dir" 2>/dev/null
+mkdir -p "$run_dir" "$log_dir" 2>/dev/null
 
+# One line per event in log/module.log. The core writes to log/sing-box.log, so
+# the two formats never mix in one file. PISING_QUIET=1 (service.sh, watchdog,
+# rule calls) keeps stdout empty: the line is already in the log and nobody reads
+# the service's stdout, so it would otherwise be written twice.
 log() {
     _lvl="$1"; shift
-    _msg="$(date '+%Y-%m-%d %H:%M:%S') [${_lvl}] $*"
-    printf '%s\n' "$_msg" >> "$log_file" 2>/dev/null
-    printf '%s\n' "$_msg"
+    _msg="$(date '+%Y-%m-%d %H:%M:%S') [${_lvl}] [${PISING_LOG_TAG:-cli}] $*"
+    _size=0
+    [ -f "$module_log" ] && _size=$(wc -c < "$module_log" 2>/dev/null)
+    if [ "${_size:-0}" -gt 262144 ]; then
+        mv -f "$module_log" "${module_log}.1" 2>/dev/null
+    fi
+    printf '%s\n' "$_msg" >> "$module_log" 2>/dev/null
+    [ "${PISING_QUIET:-0}" = "1" ] || printf '%s\n' "$_msg"
+    return 0
 }
 
 # ---------------------------------------------------------------- internals
@@ -51,11 +69,18 @@ find_busybox() {
 
 find_pid() {
     if command -v pidof >/dev/null 2>&1; then
-        pidof "$bin_name" 2>/dev/null | awk '{ print $1 }'
-    elif command -v pgrep >/dev/null 2>&1; then
+        _p="$(pidof "$bin_name" 2>/dev/null | awk '{ print $1 }')"
+        if [ -n "${_p:-}" ]; then
+            printf '%s' "$_p"
+            return 0
+        fi
+    fi
+    # pidof matches the kernel's comm, which is not bin_name when the core is a
+    # wrapper (or was renamed); the full command line still contains bin_path.
+    if command -v pgrep >/dev/null 2>&1; then
         pgrep -f "$bin_path" 2>/dev/null | head -n 1
     else
-        ps -A 2>/dev/null | awk -v b="$bin_name" '$NF ~ b && $1 != "PID" { print $2; exit }'
+        ps -A 2>/dev/null | awk -v b="$bin_path" 'index($0, b) { print $2; exit }'
     fi
 }
 
@@ -68,22 +93,123 @@ running_pid() {
     find_pid
 }
 
+# The root manager shows module.prop's description under the module card. A
+# stopped core cannot say anything by itself (there is no process), so every
+# state change writes one line there: 🟢 running / 🔴 stopped, the way
+# android-bridge does it. The write is skipped when the text is unchanged, so
+# the watchdog does not touch the file every interval.
 update_desc() {
-    [ -f "$mod_dir/module.prop" ] || return 0
-    _time="$(date '+%H:%M')"
-    sed -i "s#^description=.*#description=[ ${_time} | $1 ] sing-box + TPROXY (${proxy_mode}, port ${tproxy_port})#" "$mod_dir/module.prop" 2>/dev/null
+    _prop="${mod_dir}/module.prop"
+    [ -f "$_prop" ] || return 0
+    _desc="$1 | sing-box + TPROXY ${proxy_mode:-?}, ${tproxy_port:-?}"
+    _cur="$(sed -n 's/^description=//p' "$_prop" 2>/dev/null | head -n 1)"
+    [ "$_cur" = "$_desc" ] && return 0
+    sed -i "s#^description=.*#description=${_desc}#" "$_prop" 2>/dev/null
     return 0
 }
 
-# Keep the log from growing forever on a phone that never reboots.
-rotate_log() {
-    [ -f "$log_file" ] || return 0
-    _size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
-    if [ "${_size:-0}" -gt 1048576 ]; then
-        mv -f "$log_file" "${log_file}.1" 2>/dev/null
-        : > "$log_file" 2>/dev/null
-        log Info "log rotated (${_size} bytes)"
+# Sets _dash_line/_dash_old/_dash_new from services[].dashboard. A relative path
+# is resolved next to config.json, never against -D run/: the dashboard files
+# belong with the config that names them. An absolute path is used untouched.
+read_dashboard() {
+    _dash_line=0 _dash_old="" _dash_new=""
+    [ -f "$config_path" ] || return 1
+    _found="$(awk -v base="$config_dir" '
+        function resolve(p) { return (p ~ /^\//) ? p : base "/" p }
+        { line[NR] = $0 }
+        END {
+            for (i = 1; i <= NR; i++) {
+                if (line[i] ~ /"dashboard"[ \t]*:[ \t]*"/) {
+                    v = line[i]
+                    sub(/^.*"dashboard"[ \t]*:[ \t]*"/, "", v)
+                    sub(/".*$/, "", v)
+                    if (v != "") print i "\t" v "\t" resolve(v)
+                    exit
+                }
+                if (line[i] ~ /"dashboard"[ \t]*:[ \t]*\{/) {
+                    # a one-line object: { "path": "ui" } on the same line
+                    if (line[i] ~ /"path"[ \t]*:[ \t]*"/) {
+                        v = line[i]
+                        sub(/^.*"path"[ \t]*:[ \t]*"/, "", v)
+                        sub(/".*$/, "", v)
+                        if (v != "") print i "\t" v "\t" resolve(v)
+                        exit
+                    }
+                    for (j = i + 1; j <= NR; j++) {
+                        if (line[j] ~ /^[ \t]*\}/) break
+                        if (line[j] ~ /"path"[ \t]*:[ \t]*"/) {
+                            v = line[j]
+                            sub(/^.*"path"[ \t]*:[ \t]*"/, "", v)
+                            sub(/".*$/, "", v)
+                            if (v != "") print j "\t" v "\t" resolve(v)
+                            exit
+                        }
+                    }
+                    exit
+                }
+            }
+        }' "$config_path")"
+    [ -n "${_found:-}" ] || return 1
+    _dash_line="${_found%%"$TAB"*}"
+    _rest="${_found#*"$TAB"}"
+    _dash_old="${_rest%%"$TAB"*}"
+    _dash_new="${_rest#*"$TAB"}"
+    return 0
+}
+
+dashboard_path() {
+    read_dashboard || return 0
+    printf '%s' "$_dash_new"
+}
+
+sync_dashboard() {
+    read_dashboard || return 0
+    [ "$_dash_old" = "$_dash_new" ] && return 0
+    _tmp="${run_dir}/config.dash.tmp"
+    awk -v ln="$_dash_line" -v abs="$_dash_new" '
+        NR == ln {
+            if ($0 ~ /"dashboard"[ \t]*:[ \t]*\{/)
+                sub(/"path"[ \t]*:[ \t]*"[^"]*"/, "\"path\": \"" abs "\"")
+            else if ($0 ~ /"dashboard"[ \t]*:/)
+                sub(/"dashboard"[ \t]*:[ \t]*"[^"]*"/, "\"dashboard\": \"" abs "\"")
+            else
+                sub(/"path"[ \t]*:[ \t]*"[^"]*"/, "\"path\": \"" abs "\"")
+        }
+        { print }' "$config_path" > "$_tmp" 2>/dev/null
+    if [ -s "$_tmp" ]; then
+        mv -f "$_tmp" "$config_path"
+        log Info "dashboard: ${_dash_old} -> ${_dash_new}"
     fi
+    rm -f "$_tmp"
+    return 0
+}
+
+# settings.ini owns the core log level. The core writes into log/sing-box.log,
+# and one INFO line per connection is the bulk of the module's disk writes on a
+# phone, so the default is warn. "config" leaves config.json in charge.
+sync_log_level() {
+    # The default has to be resolved in a variable: an old settings.ini has no
+    # core_log_level line, and "$core_log_level" under set -u would fail before
+    # awk ever runs.
+    _lvl="${core_log_level:-warn}"
+    case "$_lvl" in
+        ""|config|keep) return 0 ;;
+        trace|debug|info|warn|error|fatal|panic) ;;
+        *) log Warn "core_log_level=${core_log_level} is not a level, using config.json"; return 0 ;;
+    esac
+    _tmp="${run_dir}/config.level.tmp"
+    awk -v lvl="$_lvl" '
+        /"log"[ \t]*:[ \t]*\{/ { inlog = 1 }
+        inlog && /"level"[ \t]*:[ \t]*"/ {
+            sub(/"level"[ \t]*:[ \t]*"[^"]*"/, "\"level\": \"" lvl "\"")
+            inlog = 0
+        }
+        inlog && /^[ \t]*\}/ { inlog = 0 }
+        { print }' "$config_path" > "$_tmp" 2>/dev/null
+    if [ -s "$_tmp" ] && ! cmp -s "$_tmp" "$config_path"; then
+        mv -f "$_tmp" "$config_path"
+    fi
+    rm -f "$_tmp"
     return 0
 }
 
@@ -129,26 +255,26 @@ selftest() {
     fi
     if [ -n "$_direct" ]; then
         log Warn "selftest: proxied path failed, tunnel is probably down (rules kept, fail closed)"
-        update_desc "tunnel down"
+        update_desc "🟠 Running - tunnel down"
         return 1
     fi
     log Error "selftest: both paths failed, removing the rules to keep the phone online"
-    do_off
-    update_desc "rules removed by selftest"
+    "${bin_dir}/pi.iptables" off >/dev/null 2>&1
+    update_desc "🟠 Rules off (selftest)"
     return 1
 }
 
 launch() {
     if command -v nohup >/dev/null 2>&1; then
         if command -v setsid >/dev/null 2>&1; then
-            nohup setsid "$@" >> "$log_file" 2>&1 &
+            nohup setsid "$@" >> "$core_log" 2>&1 &
         else
-            nohup "$@" >> "$log_file" 2>&1 &
+            nohup "$@" >> "$core_log" 2>&1 &
         fi
     elif command -v setsid >/dev/null 2>&1; then
-        setsid "$@" >> "$log_file" 2>&1 &
+        setsid "$@" >> "$core_log" 2>&1 &
     else
-        "$@" >> "$log_file" 2>&1 &
+        "$@" >> "$core_log" 2>&1 &
     fi
 }
 
@@ -187,12 +313,49 @@ sync_config() {
     fi
     # optional second loop guard: sing-box sets SO_MARK on its own outbound sockets
     sed -i "s/\(\"routing_mark\"[[:space:]]*:[[:space:]]*\)[0-9]\+/\1${routing_mark}/g" "$config_path"
+    sync_dashboard
+    sync_log_level
+    return 0
+}
+
+# --disable-color keeps ANSI escapes out of a file that is never a terminal.
+# Older cores do not know the flag, so it is detected instead of assumed.
+core_flags() {
+    "$bin_path" run --help 2>&1 | grep -q -- '--disable-color' && printf '%s' '--disable-color'
     return 0
 }
 
 # sing-box validates the config (schema + rule sets) before we touch any rule.
 check_config() {
-    "$bin_path" check -D "$run_dir" -c "$config_path" >> "$log_file" 2>&1
+    # shellcheck disable=SC2046
+    "$bin_path" check -D "$run_dir" -c "$config_path" $(core_flags) >> "$core_log" 2>&1
+}
+
+# One core log per run. The previous one stays as sing-box.log.1, so the reason
+# a core died can still be read after the next start, and the file never grows
+# forever on a phone that does not reboot.
+prepare_core_log() {
+    mkdir -p "$log_dir" 2>/dev/null
+    [ -s "$core_log" ] && mv -f "$core_log" "${core_log}.1" 2>/dev/null
+    printf '== %s | %s start ==\n' "$(core_version "$bin_path")" "$(date '+%F %T')" >> "$core_log"
+    return 0
+}
+
+# Wait for the process to appear instead of sleeping a fixed 2 s. The core
+# usually reports its pid in under 300 ms; a dead core fails the start sooner.
+wait_pid() {  # $1 = seconds; prints the first pid found
+    _n=0
+    _max=$(( ${1:-5} * 10 ))
+    while [ "$_n" -lt "$_max" ]; do
+        _p="$(find_pid)"
+        if [ -n "${_p:-}" ]; then
+            printf '%s' "$_p"
+            return 0
+        fi
+        sleep 0.1
+        _n=$((_n + 1))
+    done
+    return 1
 }
 
 # Start the core as ${core_user}:${core_group} so pi.iptables can bypass it by
@@ -224,46 +387,52 @@ start_core() {
 # ----------------------------------------------------------------- actions
 
 do_start() {
+    rm -f "$state_file"
     if [ ! -x "$bin_path" ]; then
         log Error "no core at ${bin_path}: run 'pi-sing update-core' to install one"
+        update_desc "🔴 No core"
         return 1
     fi
     _running="$(running_pid)"
     if [ -n "${_running:-}" ]; then
         printf '%s\n' "$_running" > "$pid_file"
         log Info "already running (pid ${_running})"
+        update_desc "🟢 Running (pid ${_running})"
         return 0
     fi
     sync_config || return 1
+    prepare_core_log
     if ! check_config; then
-        log Error "sing-box check failed, see ${log_file}"
-        update_desc "config error"
+        log Error "sing-box check failed, see ${core_log}"
+        update_desc "🔴 Config error"
         return 1
     fi
-    rotate_log
-    printf '\n==== %s start ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$log_file"
-    start_core "$bin_path" run -D "$run_dir" -c "$config_path"
-    sleep 2
-    _pid="$(find_pid)"
+    log Info "starting ${bin_name} (log: ${core_log})"
+    # shellcheck disable=SC2046
+    start_core "$bin_path" run -D "$run_dir" -c "$config_path" $(core_flags)
+    _pid="$(wait_pid 6)"
     if [ -z "${_pid:-}" ]; then
-        log Error "sing-box exited, see ${log_file}"
-        update_desc "failed to start"
+        log Error "sing-box exited, see ${core_log}"
+        update_desc "🔴 Failed to start"
         return 1
     fi
     printf '%s\n' "$_pid" > "$pid_file"
     log Info "sing-box running (pid ${_pid})"
-    "${bin_dir}/pi.iptables" on >> "$log_file" 2>&1 || {
-        log Error "failed to install TPROXY rules"
-        update_desc "rules error"
+    if ! PISING_QUIET=1 "${bin_dir}/pi.iptables" on; then
+        log Error "failed to install TPROXY rules, see ${module_log}"
+        update_desc "🔴 Rules error"
         return 1
-    }
-    update_desc "running pid ${_pid}"
+    fi
+    update_desc "🟢 Running (pid ${_pid})"
     selftest || return 1
     return 0
 }
 
 do_stop() {
-    "${bin_dir}/pi.iptables" off >> "$log_file" 2>&1
+    # Set before the core is killed, so a watchdog tick cannot see "no process"
+    # and restart it between the kill and the end of this function.
+    : > "$state_file" 2>/dev/null
+    [ -x "${bin_dir}/pi.iptables" ] && PISING_QUIET=1 "${bin_dir}/pi.iptables" off
     _pid="$(running_pid)"
     if [ -n "${_pid:-}" ]; then
         kill -15 "$_pid" 2>/dev/null
@@ -278,7 +447,7 @@ do_stop() {
         log Info "sing-box is not running"
     fi
     rm -f "$pid_file" "${run_dir}/core.gid"
-    update_desc "idle"
+    update_desc "🔴 Stopped"
     return 0
 }
 
@@ -301,13 +470,25 @@ do_status() {
     iptables -t mangle -S OUTPUT 2>/dev/null | grep -qF PISING_LOCAL &&
         printf 'iptables   : hooked into mangle OUTPUT/PREROUTING\n' ||
         printf 'iptables   : not hooked\n'
-    printf 'logs       : %s\n' "$log_file"
+    _dash="$(dashboard_path)"
+    if [ -n "${_dash:-}" ]; then
+        if [ -d "$_dash" ]; then
+            printf 'dashboard  : %s (served by services.api)\n' "$_dash"
+        else
+            printf 'dashboard  : %s (missing, the core fills it on start)\n' "$_dash"
+        fi
+    fi
+    printf 'logs       : %s/{module,sing-box}.log\n' "$log_dir"
     return 0
 }
 
 do_log() {
+    case "${1:-}" in
+        core|sing-box) _file="$core_log"; shift ;;
+        *)             _file="$module_log" ;;
+    esac
     _lines="${1:-40}"
-    tail -n "$_lines" "$log_file" 2>/dev/null || printf '(no log yet)\n'
+    tail -n "$_lines" "$_file" 2>/dev/null || printf '(no log yet: %s)\n' "$_file"
     return 0
 }
 
@@ -430,7 +611,7 @@ do_update_core() {
     fi
     log Info "update: sha256 ok (${_want})"
 
-    ( cd "$_upd" && tar -xzf "$_tar" ) >> "$log_file" 2>&1 ||
+    ( cd "$_upd" && tar -xzf "$_tar" ) >> "$module_log" 2>&1 ||
         { log Error "update: cannot extract ${_tar}"; return 1; }
     _src="${_upd}/sing-box-${_ver}-android-${_arch}"
     [ -f "${_src}/sing-box" ] ||
@@ -447,7 +628,7 @@ do_update_core() {
     # -D a scratch dir: the live cache.db belongs to the running core.
     mkdir -p "${_upd}/check"
     if [ -f "$config_path" ] &&
-       ! "${_src}/sing-box" check -D "${_upd}/check" -c "$config_path" >> "$log_file" 2>&1; then
+       ! "${_src}/sing-box" check -D "${_upd}/check" -c "$config_path" >> "$module_log" 2>&1; then
         log Error "update: core ${_ver} rejects ${config_path}, keeping ${_cur:-the current core}"
         return 1
     fi
@@ -488,9 +669,17 @@ do_watchdog() {
     log Info "watchdog started (${watchdog_interval}s)"
     _iface=""
     _nocore=0
+    _last=""
     while :; do
         sleep "$watchdog_interval"
-        if [ -z "$(running_pid)" ]; then
+        if [ -f "$state_file" ]; then
+            # A user stop (action button / `pi-sing stop`): stay down. A crash
+            # has no flag, so it is still restarted.
+            _last=""
+            continue
+        fi
+        _now="$(running_pid)"
+        if [ -z "${_now:-}" ]; then
             if [ -x "$bin_path" ]; then
                 _nocore=0
                 log Warn "sing-box is gone, restarting"
@@ -500,15 +689,21 @@ do_watchdog() {
                 # would only repeat the same error, so say it once and wait.
                 _nocore=1
                 log Warn "no core at ${bin_path}: run 'pi-sing update-core' (watchdog idle)"
+                update_desc "🔴 No core"
             fi
-        elif [ "$_nocore" != "0" ]; then
+            _last=""
+        elif [ "$_now" != "$_last" ]; then
+            # Keeps the module card honest even when somebody starts or stops the
+            # core outside this watchdog.
+            update_desc "🟢 Running (pid ${_now})"
+            _last="$_now"
             _nocore=0
         fi
         _cur="$(ip route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
         if [ -n "$_cur" ] && [ "$_cur" != "$_iface" ]; then
             if [ -n "$_iface" ]; then
                 log Info "default interface ${_iface} -> ${_cur}, renewing rules"
-                "${bin_dir}/pi.iptables" renew >> "$log_file" 2>&1
+                PISING_QUIET=1 "${bin_dir}/pi.iptables" renew
             fi
             _iface="$_cur"
         fi
@@ -520,12 +715,13 @@ case "${1:-}" in
     stop)     do_stop ;;
     restart)  do_stop; do_start ;;
     status)   do_status ;;
-    log)      shift; do_log "${1:-40}" ;;
+    log)      shift; do_log "$@" ;;
     iptables) shift; "${bin_dir}/pi.iptables" "${1:-status}" ;;
     update-core) do_update_core ;;
     watchdog) do_watchdog ;;
+    mark)     shift; update_desc "$*" ;;
     *)
-        printf 'usage: %s {start|stop|restart|status|log [n]|iptables <on|off|renew|status>|update-core|watchdog}\n' "$0" >&2
+        printf 'usage: %s {start|stop|restart|status|log [core] [n]|iptables <on|off|renew|status>|update-core|watchdog|mark <state>}\n' "$0" >&2
         exit 1
         ;;
 esac

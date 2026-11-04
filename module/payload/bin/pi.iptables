@@ -26,20 +26,30 @@ set -u
 PISING_DIR="${PISING_DIR:-/data/adb/pi-sing}"
 settings="${PISING_DIR}/settings.ini"
 run_dir="${PISING_DIR}/run"
-log_file="${run_dir}/iptables.log"
 
 [ -f "$settings" ] || { printf 'pi.iptables: settings not found: %s\n' "$settings" >&2; exit 1; }
 . "$settings"
 [ -n "${list_dir:-}" ] ||
     { printf 'pi.iptables: %s is from an older layout, reinstall the module\n' "$settings" >&2; exit 1; }
 
-mkdir -p "$run_dir" 2>/dev/null
+log_dir="${log_dir:-${run_dir}/log}"
+module_log="${log_dir}/module.log"
+mkdir -p "$run_dir" "$log_dir" 2>/dev/null
 
+# Same file as the CLI, tagged [rules], so `pi-sing log` shows the whole story
+# in order. PISING_QUIET=1 is set when the CLI calls this script: the line is
+# already in the log and printing it again would duplicate it in service output.
 log() {
     _lvl="$1"; shift
-    _msg="$(date '+%Y-%m-%d %H:%M:%S') [${_lvl}] $*"
-    printf '%s\n' "$_msg" >> "$log_file" 2>/dev/null
-    printf '%s\n' "$_msg"
+    _msg="$(date '+%Y-%m-%d %H:%M:%S') [${_lvl}] [rules] $*"
+    _size=0
+    [ -f "$module_log" ] && _size=$(wc -c < "$module_log" 2>/dev/null)
+    if [ "${_size:-0}" -gt 262144 ]; then
+        mv -f "$module_log" "${module_log}.1" 2>/dev/null
+    fi
+    printf '%s\n' "$_msg" >> "$module_log" 2>/dev/null
+    [ "${PISING_QUIET:-0}" = "1" ] || printf '%s\n' "$_msg"
+    return 0
 }
 
 # Android 11+ ships iptables 1.8, which takes the xtables lock; -w waits for it.
@@ -75,44 +85,48 @@ local_addrs() {
     esac
 }
 
-# Resolve package.list.cfg entries to uids in ${uid_file}.
+# Resolve package.list.cfg entries to uids in ${uid_file}. Both files are read
+# once: the old form ran one awk per app against packages.list, which is a fork
+# per entry on every start. Unresolved entries are marked with a leading "!" so
+# the normal uids stay in one file.
 read_uid_list() {
     : > "$uid_file" 2>/dev/null
     pkg_cfg="${list_dir}/package.list.cfg"
     [ -f "$pkg_cfg" ] || return 0
-    entries="$(awk '
+    _raw="${run_dir}/appuid.raw"
+    # Not every host has the Android package database (the netns test does not);
+    # a missing file must still resolve numeric uids instead of failing awk.
+    _pkgs="$packages_list_file"
+    [ -f "$_pkgs" ] || _pkgs=/dev/null
+    awk -v cfg="$pkg_cfg" '
         function trim(s) { gsub(/^[ \t\r]+/, "", s); gsub(/[ \t\r]+$/, "", s); return s }
-        /^[ \t]*#/ { next }
-        {
-            sub(/[ \t]*#.*/, "", $0)
-            line = trim($0)
-            if (line == "") next
-            if (line ~ /^mode:/) next
-            print line
-        }' "$pkg_cfg")"
-    [ -n "$entries" ] || return 0
-
-    printf '%s\n' "$entries" | while IFS= read -r entry; do
-        [ -n "$entry" ] || continue
-        case "$entry" in
-            *[!0-9]*)
-                case "$entry" in
-                    *:*) user="${entry%%:*}"; pkg="${entry#*:}" ;;
-                    *)   user=0; pkg="$entry" ;;
-                esac
-                case "$user" in *[!0-9]*|"") user=0 ;; esac
-                appid="$(awk -v p="$pkg" '$1 == p { print $2; exit }' "$packages_list_file" 2>/dev/null)"
-                if [ -n "${appid:-}" ]; then
-                    printf '%s\n' "$((user * 100000 + appid))" >> "$uid_file"
-                else
-                    log Warn "uid not found for ${pkg} (user ${user}), skipped"
-                fi
-                ;;
-            *)
-                printf '%s\n' "$entry" >> "$uid_file"
-                ;;
-        esac
+        FILENAME == cfg {
+            line = $0
+            sub(/[ \t]*#.*/, "", line)
+            line = trim(line)
+            if (line == "" || line ~ /^mode:/) next
+            entry[++n] = line
+            next
+        }
+        { appid[$1] = $2 }
+        END {
+            for (i = 1; i <= n; i++) {
+                e = entry[i]
+                if (e !~ /[^0-9]/) { print e; continue }
+                user = 0; pkg = e
+                p = index(e, ":")
+                if (p > 0) { user = substr(e, 1, p - 1); pkg = substr(e, p + 1) }
+                if (user !~ /^[0-9]+$/) user = 0
+                if (pkg in appid) print (user * 100000 + appid[pkg])
+                else print "!" pkg ":" user
+            }
+        }' "$pkg_cfg" "$_pkgs" > "$_raw" 2>/dev/null
+    grep -v '^!' "$_raw" >> "$uid_file" 2>/dev/null
+    grep '^!' "$_raw" 2>/dev/null | while IFS= read -r _miss; do
+        _miss="${_miss#!}"
+        log Warn "uid not found for ${_miss%%:*} (user ${_miss#*:}), skipped"
     done
+    rm -f "$_raw"
     return 0
 }
 
@@ -301,7 +315,7 @@ apply_v6_block() {
     i6 -t filter -A "$c_v6" -j REJECT
     i6 -t filter -I OUTPUT -j "$c_v6"
     i6 -t filter -I FORWARD -j "$c_v6"
-    log Info "ipv6=block: IPv6 rejected (DNS forced to the hijacked IPv4 path)"
+    return 0
 }
 
 teardown_proto() {
@@ -351,28 +365,25 @@ do_on() {
     iptables $IPT_WAIT -t mangle -S >/dev/null 2>&1 || { log Error "mangle table unavailable"; return 1; }
     read_uid_list
     read_ap_list
-    do_off >/dev/null 2>&1
+    do_off quiet
 
-    log Info "installing TPROXY rules"
     apply_proto i4 4
-    case "$(ipv6_mode)" in
-        proxy)
-            apply_proto i6 6
-            log Info "ipv6=proxy: IPv6 rules installed"
-            ;;
+    _v6="$(ipv6_mode)"
+    case "$_v6" in
+        proxy) apply_proto i6 6 ;;
         block) apply_v6_block ;;
-        *) log Warn "ipv6=off: IPv6 traffic is NOT proxied and can leak" ;;
+        *)     log Warn "ipv6=off: IPv6 traffic is NOT proxied and can leak" ;;
     esac
-    _bypass="${bypass_interfaces:-none}"
-    log Info "tproxy ${tproxy_port}/tcp+udp, fwmark ${fwmark}, table ${table}, pref ${pref}, mode ${proxy_mode}"
-    log Info "bypass interfaces: ${_bypass}"
+    # One result line per `on`: the settings are in settings.ini, repeating them
+    # on every renew is what made the logs noisy.
+    log Info "rules installed: ${tproxy_port}/tcp+udp, table ${table}, mode ${proxy_mode}, ipv6 ${_v6}"
     return 0
 }
 
-do_off() {
+do_off() {  # $1 = quiet (called from do_on, which reinstalls right away)
     teardown_proto i4 4
     teardown_proto i6 6
-    log Info "TPROXY rules removed"
+    [ "${1:-}" = "quiet" ] || log Info "TPROXY rules removed"
     return 0
 }
 

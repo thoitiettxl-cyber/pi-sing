@@ -85,8 +85,10 @@ with zipfile.ZipFile(sys.argv[1]) as z:
         print("   ", n)
 PY
 
-    # The installer is the only thing that knows the on-device layout; exercise it
-    # against the zip that was just built (fresh install + migration from v1.0.0).
+    # The CLI behaviour (dashboard path, log split, description) needs no device,
+    # and the installer is the only thing that knows the on-device layout.
+    echo
+    bash "${ROOT}/tests/cli-test.sh"
     echo
     bash "${ROOT}/tests/installer-test.sh" "$OUT"
 }

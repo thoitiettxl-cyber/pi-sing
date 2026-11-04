@@ -23,12 +23,12 @@ installed, watchdog up):
 
 | check | command | result |
 | --- | --- | --- |
-| traffic exit | `curl https://1.1.1.1/cdn-cgi/trace` | `ip=185.98.169.17 loc=US` (the WireGuard endpoint), not the carrier `＜carrier-ip＞` |
+| traffic capture | `su -c /dev/pi-sing log core 200` while an app connects | `inbound/tproxy[tproxy-in]: inbound connection …` for the request; the outbound row then shows the config's chosen outbound (this config sends most rules through a `direct` tag, so the exit address is the carrier's) |
 | DNS through the tunnel | `curl -o /dev/null -w '%{remote_ip}' https://www.wikipedia.org` | `198.18.0.32` — a sing-box **fakeip**, so the name was resolved by sing-box, not by Android |
-| resolver as the outside world sees it | `curl -sL https://edns.ip-api.com/json` | `United States - Google LLC` (DNS-over-HTTPS inside the tunnel), not the ISP resolver it reported before the fix |
+| resolver as the outside world sees it | `curl -sL https://edns.ip-api.com/json` | `Singapore - Google LLC` (`172.253.211.85`), i.e. the resolver named in config.json, not the ISP resolver |
 | IPv6 leak | `curl -6 https://ipv6.icanhazip.com` | fails (`rc=6`) and `PISING_V6BLOCK` rejects it; the phone's own `2402:800:…` address never reaches the network |
 | QUIC | `iptables -t filter -S PISING_GUARD` | `udp 443`/`udp 80` rejected, so apps fall back to TCP through the proxy |
-| container path | `curl https://api.ipify.org` from the Droidspaces Debian container | `＜carrier-ip＞` — bypassed, the container keeps its own path (and the operator's own access) |
+| container path | `curl https://api.ipify.org` from the Droidspaces Debian container | HTTP 200, the carrier address — the `ds-*`/`vgate0` bypass kept the container online through every restart |
 
 Host-side tests, run on the same kernel:
 
@@ -36,11 +36,14 @@ Host-side tests, run on the same kernel:
 tests/smoke-check.sh                  every script parses (dash), both configs pass `sing-box check` 1.14.4
 tests/netns-tproxy-test.sh            14/14 — TCP, UDP/53 hijack, per-app blacklist + whitelist,
                                       core-gid bypass (no capture loop), clean teardown
-tests/installer-test.sh               44/44 — fresh install, migration from the v1.0.0 flat
-                                      layout (kept files, moved cache, appended paths),
-                                      idempotent re-run, stale watchdog killed,
-                                      thin zip with no core (skipped and failed download,
-                                      existing core kept), old settings.ini rejected
+tests/cli-test.sh                     27/27 — dashboard resolution (relative/object/absolute),
+                                      core_log_level, 🟢/🔴 description, log split, log rotation,
+                                      watchdog leaves a user-stopped core stopped
+tests/installer-test.sh               63/63 — fresh install, wrapper files (no symlinks),
+                                      migration from the v1.0.0 flat layout, run/ui move,
+                                      idempotent re-run, stale watchdog killed, volume-key
+                                      prompt (+) / (-), thin zip with no core, failed
+                                      download, old settings.ini rejected
 tests/update-core-test.sh             29/29 — update-core against a fake release API: digest
                                       verified, swap + restart, "already latest" no-op,
                                       bad digest / failing `check` / dead core refused,
@@ -49,12 +52,12 @@ tests/update-core-test.sh             29/29 — update-core against a fake relea
 ```
 
 Not verified: the `ipv6=proxy` mode (this tunnel carries IPv4 only — measured),
-hotspot/tether capture (`ap.list.cfg`), an actual key press during a thin
-install — `getevent`/`timeout` exist on the ROM, `/dev/input` is readable by root
-and `timeout 1 getevent -lqc 1` returns empty after 1 s (measured), but no key was
-pressed while flashing; the installer test drives the same decision through
-`PISING_INSTALL_CORE`. Also not verified: the first boot of the service on a fresh
-reboot (the service was exercised by running `service.sh` directly).
+hotspot/tether capture (`ap.list.cfg`), and an actual key press during the
+manager's flash UI — `getevent`/`timeout` exist on the ROM and the installer test
+drives both keys with a fake `getevent`, but the volume keys were not pressed in
+the KernelSU installer itself. Also not verified: the first boot of the service
+after a real reboot (the service was exercised by running `service.sh` directly,
+as this agent's shell runs through the phone).
 
 ## Layout
 
@@ -106,46 +109,107 @@ On the device:
   bin/                          pi-sing, pi.iptables, sing-box, sing-box.LICENSE
   config/                       config.json, config.example.json
   lists/                        package.list.cfg, ap.list.cfg
-  run/                          pid, logs, generated lists, sing-box cache.db
-  pi-sing, pi.iptables          symlinks to bin/ (see the upgrade note)
-/dev/pi-sing -> /data/adb/pi-sing/bin/pi-sing
+  config/ui/                    dashboard served by services.api (created by sing-box)
+  run/                          pid, stop intent, generated lists, sing-box cache.db
+  run/log/                      module.log, sing-box.log (+.1 each)
+  pi-sing, pi.iptables          real wrapper files that exec bin/ (no symlinks)
+/dev/pi-sing                    real wrapper file, recreated by service.sh at boot
 ```
 
 `bin/` and `config/config.example.json` are replaced on upgrade; `settings.ini`,
 `config/config.json` and the two files in `lists/` are kept. An install from the
 old flat layout is moved into these directories by `customize.sh` (existing
-values untouched), and an older `settings.ini` gets the `*_dir` block appended —
-it does not have one, so the scripts would otherwise refuse to guess.
+values untouched), and an older `settings.ini` gets the `*_dir`, `log_dir` and
+`core_log_level` lines appended — it does not have them, and the scripts refuse to
+guess the paths.
 
-The installer asks nothing unless the zip is a thin build, and then only on a
-phone that has no core yet: Volume Up downloads the release `update-core` follows
-(~24 MB, verified against the digest in the API response), Volume Down — or 15 s
-without a key press — skips it, `PISING_INSTALL_CORE=1|0` answers without a key.
-A failed download never aborts the flash: it prints the reason and the next step,
-and `su -c /dev/pi-sing update-core` finishes the job. A phone that already has a
-core keeps it byte for byte, so re-flashing a thin zip costs nothing.
+**The installer always asks one question**, whatever the zip carries:
 
-`pi-sing` and `pi.iptables` at the top of the data dir are symlinks into `bin/`
-because the manager (measured with KernelSU 3.3.1) stages a module update in
-`/data/adb/modules_update` and applies its `service.sh`/`action.sh` only on the
-next boot: until then the previous boot script runs, and it calls
-`/data/adb/pi-sing/pi-sing`. Without the link the module cannot start between an
-in-app upgrade and a reboot. A watchdog loop from the previous version is killed
-by the installer (SIGTERM then SIGKILL — the loop survives SIGTERM on this ROM).
+```
+  Volume keys (15 s):
+    (+) UP   = download the latest sing-box core from GitHub
+    (-) DOWN = keep the core in this zip / already on the phone
+    no key   = keep
+```
+
+`(+)` runs the same `update-core` path as the CLI: the release comes from GitHub's
+latest tag, the archive must match GitHub's sha256 digest, and the binary must
+pass `check` with the live config. A failed download never aborts the flash — the
+bundled or installed core stays and the log says why. `PISING_INSTALL_CORE=1|0`
+answers without a key (unattended flashes, tests). With no `getevent` or `/dev/input`
+in the installer context, the default (keep) is taken after printing the prompt.
+
+The top-level `pi-sing` and `pi.iptables` are **real wrapper files** (a 3-line
+`exec` into `bin/`), not symlinks: a backup/copy tool that drops links leaves a
+working path, and `ls -l` shows a script. They exist because the manager (measured
+with KernelSU 3.3.1) stages a module update in `/data/adb/modules_update` and
+applies its `service.sh`/`action.sh` only on the next boot: until then the previous
+boot script runs, and it calls `/data/adb/pi-sing/pi-sing`. `/dev/pi-sing` is a
+real wrapper file too and is recreated by `service.sh` on every boot (its tmpfs is
+empty after a reboot). A watchdog loop from the previous version is killed by the
+installer (SIGTERM then SIGKILL — the loop survives SIGTERM on this ROM).
 
 ## Usage
 
 ```
 su -c /dev/pi-sing start        # run sing-box, install the rules, self-test
-su -c /dev/pi-sing stop         # remove the rules, stop sing-box
+su -c /dev/pi-sing stop         # remove the rules, stop sing-box (the watchdog stays down)
 su -c /dev/pi-sing restart
-su -c /dev/pi-sing status
-su -c /dev/pi-sing log 80
+su -c /dev/pi-sing status       # process, rules, dashboard path, log paths
+su -c /dev/pi-sing log 80       # module.log (events)
+su -c /dev/pi-sing log core 80  # sing-box.log (the core's own output)
 su -c /dev/pi-sing iptables off|on|renew|status
 su -c /dev/pi-sing update-core  # install the latest sing-box from GitHub
 ```
 
-`action.sh` (manager action button) does the same toggle.
+`action.sh` (manager action button) does the same toggle and ends with
+`Pi-Sing is ON` / `Pi-Sing is OFF`.
+
+`stop` writes `run/stopped`; `start` removes it. The watchdog restarts a **crashed**
+core but leaves a **user-stopped** one alone — before this, the action button's
+OFF was undone at the next 30 s tick.
+
+## State and logs
+
+- **Module card**: the manager shows `module.prop`'s description under the module.
+  Every state change writes one line, the way
+  [`android-bridge`](https://github.com/ravindu644/android-bridge) does:
+  `🟢 Running (pid …) | sing-box + TPROXY blacklist, 1536`,
+  `🔴 Stopped`, `🟠 Running - tunnel down`, `🔴 Config error`, `🔴 No core`,
+  `🔴 Disabled (enabled=0)`, `⚪ Installed - reboot to start`.
+  The watchdog only rewrites the file when the state changes.
+- **`run/log/module.log`** — one line per module event, `[cli]` or `[rules]` or
+  `[svc]` + level + timestamp. Rotates at 256 KiB to `.1`.
+- **`run/log/sing-box.log`** — the core's stdout/stderr only (started with
+  `--disable-color`, so no ANSI escapes). One file per run; the previous run is
+  `sing-box.log.1`. At the default `core_log_level="warn"` an idle core writes
+  nothing, so the file stays at the run header.
+- The old `pi-sing.log` (core + module lines mixed), `iptables.log` and
+  `service.log` (duplicated stdout) are gone; the installer removes them.
+
+Measured on the device (Android 17, 60 s idle window): the old pair wrote
+**4 633 B/min**; the new pair writes **0 B/min** (both files unchanged), and a
+start takes ~1 s to the rules instead of ~4 s (`sleep 2` replaced by a pid wait).
+The rule set itself is byte-for-byte the same, so packet-processing cost is
+unchanged.
+
+## Dashboard (`services[].dashboard`)
+
+sing-box serves the file server at `http://127.0.0.1:9091/dashboard/`. The path in
+`config.json` is authoritative:
+
+- a **relative** path is resolved **next to `config.json`** (`"ui"` →
+  `config/ui`), never against `-D run/`; `../ui` puts it beside `config/`, an
+  **absolute** path is used as is;
+- if the directory is empty, sing-box downloads its official dashboard into it
+  (needs network once, ~8 MB);
+- an existing directory without sing-box's `.etag` is treated as user-provided and
+  is served without auto-update.
+
+`pi-sing start` rewrites only that one value (string or `{"path": …}` form) when it
+is relative, so the folder really lives where `config.json` says. The installer
+moves a dashboard left in `run/ui` by the old `-D run/` resolution to `config/ui`
+once, instead of downloading it again. `pi-sing status` prints the resolved path.
 
 `start` runs a **self-test** after installing the rules: one request from a socket
 the rules exempt (direct) and one the rules must capture (proxied). Direct OK +
@@ -200,6 +264,8 @@ unchanged.
 | `bypass_interfaces` | `ds-br+ ds-v+ vgate0 dummy0` | incoming interfaces that are never touched (Droidspaces bridges, VM gateway) |
 | `ignore_interfaces` | empty | output interfaces that are never proxied |
 | `core_user`/`core_group`/`core_gid` | `root`/`net_admin`/`3005` | the core runs as this uid:gid so its own traffic can be bypassed by gid |
+| `core_log_level` | `warn` | level written into `config.json` at start; `config`/empty leaves the file in charge. `warn` keeps one line per connection out of the log |
+| `log_dir` | `${run_dir}/log` | `module.log` and `sing-box.log` (+`.1`) |
 
 ## Rule set (mangle)
 
@@ -262,10 +328,12 @@ The template already contains the five things TPROXY on Android needs. If you
 write your own config, keep the equivalent:
 
 1. No `log.output` — the module redirects sing-box to
-   `/data/adb/pi-sing/run/pi-sing.log` (an absolute path to a directory that does
-   not exist on the phone is fatal). Likewise every relative path in the config
-   (`cache_file.path`) resolves inside `/data/adb/pi-sing/run/`, because `pi-sing`
-   runs the core with `-D /data/adb/pi-sing/run`.
+   `/data/adb/pi-sing/run/log/sing-box.log` (an `output` pointing at a directory
+   that does not exist is fatal). Every other relative path in the config
+   (`cache_file.path`, `services[].dashboard` if you leave it relative before the
+   first start) resolves inside `/data/adb/pi-sing/run/`, because `pi-sing` runs
+   the core with `-D /data/adb/pi-sing/run`; the module rewrites only the
+   dashboard path, relative to `config/`.
 2. One `{"type": "tproxy"}` inbound; its `listen_port` is owned by
    `settings.ini` (`pi-sing start` rewrites it).
 3. `route.default_domain_resolver` must be a **tunnel-side** DNS server, so every
@@ -293,6 +361,10 @@ A selector may be used as a DNS `detour`, a plain `direct` outbound may not
 - If you point DNS at a resolver that is only reachable inside the tunnel, keep
   `dns-bootstrap` available for rule-set downloads.
 - After any edit: `su -c /dev/pi-sing restart` (or `iptables renew`).
+- The module rewrites three values on start so `settings.ini` stays in charge:
+  the tproxy inbound's `listen_port`, `outbound.routing_mark` (when present) and
+  `log.level` (from `core_log_level`); plus a **relative** `services[].dashboard`
+  path, which becomes absolute under `config/`.
 
 ## License and vendored parts
 

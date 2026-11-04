@@ -22,7 +22,8 @@ NS_VETH="vns0"
 SUBNET="10.99.0.0/24"
 TMP="$(mktemp -d /tmp/pising-e2e.XXXXXX)"
 DATA="${TMP}/data"
-LOG="${DATA}/run/pi-sing.log"
+MOD_LOG="${DATA}/run/log/module.log"
+CORE_LOG="${DATA}/run/log/sing-box.log"
 PASS=0
 FAIL=0
 
@@ -30,7 +31,7 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS + 1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL + 1)); }
 note() { printf '  ---- %s\n' "$1"; }
 ns()   { ip netns exec "$NS" "$@"; }
-count_inbound() { grep -c 'inbound connection to' "$LOG" 2>/dev/null || true; }
+count_inbound() { grep -c 'inbound connection to' "$CORE_LOG" 2>/dev/null; }
 
 cleanup() {
     ip netns del "$NS" 2>/dev/null
@@ -68,6 +69,9 @@ echo "== payload"
 mkdir -p "$DATA/bin" "$DATA/config" "$DATA/lists" "$DATA/run"
 cp "$PAYLOAD/bin/pi-sing" "$PAYLOAD/bin/pi.iptables" "$DATA/bin/"
 cp "$PAYLOAD/settings.ini" "$DATA/"
+# The test reads connection lines from the core log, so do not let the module's
+# warn default silence them here.
+printf 'core_log_level="config"\n' >> "$DATA/settings.ini"
 cp "$PAYLOAD/config/config.example.json" "$DATA/config/config.json"
 cp "$PAYLOAD/lists/package.list.cfg" "$PAYLOAD/lists/ap.list.cfg" "$DATA/lists/"
 cp "$SINGBOX_BIN" "$DATA/bin/sing-box"
@@ -88,7 +92,7 @@ chmod +x "$DATA/bin/pi-sing" "$DATA/bin/pi.iptables" "$DATA/bin/sing-box"
 echo "== start"
 ns env PISING_DIR="$DATA" "$DATA/bin/pi-sing" start
 [ $? -eq 0 ] && ok "pi-sing start" || bad "pi-sing start"
-grep -q 'core runs as' "$LOG" && ok "core started with a dedicated gid ($(grep -o 'core runs as.*' "$LOG" | tail -1))" ||
+grep -q 'core runs as' "$MOD_LOG" && ok "core started with a dedicated gid ($(grep -o 'core runs as.*' "$MOD_LOG" | tail -1))" ||
     bad "core gid bypass not active"
 ns env PISING_DIR="$DATA" "$DATA/bin/pi-sing" status | sed 's/^/  /'
 

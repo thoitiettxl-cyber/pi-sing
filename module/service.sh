@@ -1,16 +1,39 @@
 #!/system/bin/sh
 # Pi-Sing boot service (Magisk/KernelSU/APatch late_start service).
 # Starts after the system finished booting and a default route exists.
+#
+# There is no service.log: pi-sing writes one line per event to
+# run/log/module.log, and the core writes to run/log/sing-box.log. This script
+# only adds the three things that can happen before the CLI is reachable.
 MODDIR=${0%/*}
 DATA=/data/adb/pi-sing
-LOG="${DATA}/run/service.log"
+LOG_DIR="${DATA}/run/log"
 
-mkdir -p "${DATA}/run" 2>/dev/null
+mkdir -p "$LOG_DIR" 2>/dev/null
+
+log() {
+    printf '%s [Info] [svc] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${LOG_DIR}/module.log" 2>/dev/null
+}
+
+# /dev is a fresh tmpfs every boot, so the real wrapper file (not a symlink) has
+# to be recreated here. A runner in /dev survives until the next reboot.
+write_shortcut() {
+    [ -d /dev ] || return 0
+    # v1.3.0 left a symlink here; writing through it would overwrite bin/pi-sing.
+    rm -f /dev/pi-sing 2>/dev/null
+    printf '#!/system/bin/sh\nexec %s/bin/pi-sing "$@"\n' "$DATA" > /dev/pi-sing 2>/dev/null &&
+        chmod 755 /dev/pi-sing 2>/dev/null
+    return 0
+}
+
+write_shortcut
+
 [ -f "${DATA}/settings.ini" ] || exit 0
 . "${DATA}/settings.ini"
 
 if [ "$enabled" != "1" ]; then
-    printf '%s [Info] disabled via settings.ini enabled=0\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG"
+    log "disabled via settings.ini enabled=0"
+    "${DATA}/bin/pi-sing" mark "🔴 Disabled (enabled=0)" >/dev/null 2>&1
     exit 0
 fi
 
@@ -28,8 +51,8 @@ fi
         [ "$i" -gt 60 ] && break
     done
 
-    "${DATA}/bin/pi-sing" start
+    PISING_QUIET=1 "${DATA}/bin/pi-sing" start
     if [ "$watchdog" = "1" ]; then
-        "${DATA}/bin/pi-sing" watchdog
+        PISING_QUIET=1 "${DATA}/bin/pi-sing" watchdog
     fi
-) >> "$LOG" 2>&1 &
+) >/dev/null 2>&1 &

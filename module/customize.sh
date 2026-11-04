@@ -30,6 +30,9 @@ case "$KSU" in
 esac
 
 ui_print "  installing to: $DATA"
+if command -v getprop >/dev/null 2>&1; then
+    ui_print "  device       : $(getprop ro.product.cpu.abi 2>/dev/null)"
+fi
 
 # A watchdog loop from the previous version outlives `stop` and keeps restarting
 # the core from a script whose paths are about to move, so it is killed first.
@@ -42,7 +45,9 @@ watchdog_pids() {
         _pid="${_entry#/proc/}"
         case "$_pid" in ''|*[!0-9]*) continue ;; esac
         [ "$_pid" = "$$" ] && continue
-        _cmd="$(tr '\0' ' ' < "$_entry/cmdline" 2>/dev/null)" || continue
+        # cat, not a redirect: a process can exit between readdir and open, and
+        # the shell reports a redirection failure even with 2>/dev/null.
+        _cmd="$(cat "$_entry/cmdline" 2>/dev/null | tr '\0' ' ')"
         case "$_cmd" in
             *"$DATA/bin/pi-sing watchdog"*|*"$DATA/pi-sing watchdog"*) printf '%s\n' "$_pid" ;;
         esac
@@ -68,13 +73,12 @@ stop_watchdog() {
 stop_watchdog
 
 # ---------------------------------------------------------------- core choice
-# The zip can ship without the core (79 MiB of GPL-3.0 binary that update-core
-# can fetch from the same release). Then the only question worth asking is
-# whether to fetch it now, and the answer has to come from the volume keys: the
-# manager installer has no TTY. `getevent -lqc 1` blocks until one event, so a
-# `timeout 1` around it gives a bounded wait. /dev/input is not readable in every
-# installer context; when no key ever arrives the caller takes its default
-# instead of hanging, and the flash itself never fails because of this.
+# One question, always asked, whatever the zip carries: check GitHub for a newer
+# core, or keep the core in this zip / on the phone. The manager installer has no
+# TTY, so the answer comes from the volume keys. `getevent -lqc 1` blocks until
+# one event, so `timeout 1` around it is a bounded wait; /dev/input is not
+# readable in every installer context, and then the default (keep) is taken
+# instead of hanging. The flash itself never fails because of this.
 read_volume_key() {  # $1 = seconds to wait -> "up" | "down" | nothing
     _left="$1"
     while [ "$_left" -gt 0 ]; do
@@ -88,34 +92,38 @@ read_volume_key() {  # $1 = seconds to wait -> "up" | "down" | nothing
     return 1
 }
 
-# Sets ASK (1 = download now, 0 = skip) and prints the prompt. It cannot return
-# the answer on stdout: the caller would swallow the prompt along with it.
-# PISING_INSTALL_CORE=1|0 answers without a key press (managers that flash
-# unattended, and the installer test).
+# Sets ASK (1 = check GitHub for a newer core, 0 = keep) and prints the prompt.
+# The prompt cannot come back on stdout: the caller would swallow it along with
+# the answer. PISING_INSTALL_CORE=1|0 answers without a key press (unattended
+# flashes and the installer test).
 ASK=0
-ask_core_download() {
+ask_core_update() {
     ASK=0
     case "${PISING_INSTALL_CORE:-ask}" in
-        1|yes|download) ASK=1; ui_print "  core  : download selected (PISING_INSTALL_CORE)"; return 0 ;;
-        0|no|skip)      ui_print "  core  : download skipped (PISING_INSTALL_CORE)"; return 0 ;;
+        1|yes|download|update) ASK=1; ui_print "  keys   : (+) update selected (PISING_INSTALL_CORE)"; return 0 ;;
+        0|no|keep|skip)        ui_print "  keys   : (-) keep selected (PISING_INSTALL_CORE)"; return 0 ;;
     esac
+    ui_print " "
+    ui_print "  Volume keys (15 s):"
+    ui_print "    (+) UP   = download the latest sing-box core from GitHub"
+    ui_print "    (-) DOWN = keep the core in this zip / already on the phone"
+    ui_print "    no key   = keep"
     if ! command -v getevent >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
-        ui_print "  core  : no volume-key input here, downloading nothing"
+        ui_print "  keys   : no key input here, keeping the current core"
         return 0
     fi
-    ui_print " "
-    ui_print "  This zip has no sing-box core."
-    ui_print "    Volume UP   = download it now (~24 MB, needs internet)"
-    ui_print "    Volume DOWN = skip it"
-    ui_print "    no key within 15s = skip"
-    if [ "$(read_volume_key 15)" = "up" ]; then
-        ASK=1
-        ui_print "  core  : download selected"
-    else
-        ui_print "  core  : skipped"
-    fi
+    case "$(read_volume_key 15)" in
+        up)   ASK=1; ui_print "  keys   : (+) pressed - checking GitHub for a newer core" ;;
+        down) ASK=0; ui_print "  keys   : (-) pressed - keeping the current core" ;;
+        *)    ASK=0; ui_print "  keys   : no key pressed - keeping the current core" ;;
+    esac
     return 0
 }
+
+# Asked before anything is copied: the answer decides whether payload/bin/sing-box
+# is kept or update-core replaces it. Always shown, so the keys are never a
+# hidden feature.
+ask_core_update
 
 # Stop a previous instance before its binary is replaced. Both entry points are
 # tried so an upgrade from the flat layout stops before it is moved.
@@ -128,11 +136,11 @@ if [ -x "$DATA/bin/pi-sing" ] || [ -x "$DATA/pi-sing" ]; then
     fi
 fi
 
-mkdir -p "$DATA/bin" "$DATA/config" "$DATA/lists" "$DATA/run"
+mkdir -p "$DATA/bin" "$DATA/config" "$DATA/lists" "$DATA/run/log"
 
 # v1.1.0 split the flat data dir into subdirectories. Move (not copy), so the old
-# files disappear and cannot be started by mistake. A top-level pi-sing/pi.iptables
-# symlink (created below for pre-reboot compatibility) is just dropped: the real
+# files disappear and cannot be started by mistake. A top-level entry point from
+# v1.3.0 (symlink) or v1.4 (wrapper) is module-owned and removed above; the real
 # file is in bin/ already.
 migrate_flat() {
     _from="$1"; _to="$2"
@@ -150,6 +158,13 @@ migrate_flat() {
     ui_print "  moved : $_from -> $_to"
     return 0
 }
+if [ -x "$DATA/bin/pi-sing" ] || [ -L "$DATA/pi-sing" ]; then
+    # v1.3.0 put symlinks here; v1.4 writes real wrapper files further down.
+    # Either way the old entry point is module-owned, not user data, so it is
+    # removed before the flat-layout migration and recreated at the end.
+    rm -f "$DATA/pi-sing" "$DATA/pi.iptables" 2>/dev/null
+fi
+
 for _pair in \
     config.json:config/config.json \
     config.example.json:config/config.example.json \
@@ -203,37 +218,75 @@ PATHS
     ui_print "  update: settings.ini (path block for bin/, config/, lists/, run/)"
 fi
 
-# The core is the only big file, and a thin build leaves it out of the zip. What
-# happens then depends on the phone: an existing core is kept as is, and a phone
-# without one is asked before anything is downloaded.
+# v1.3.0 has the directory block but no log_dir; pi-sing defaults it, appending it
+# keeps settings.ini the one place the paths are written down.
+if grep -q '^bin_dir=' "$DATA/settings.ini" && ! grep -q '^log_dir=' "$DATA/settings.ini"; then
+    printf 'log_dir="${run_dir}/log"\n' >> "$DATA/settings.ini"
+    ui_print "  update: settings.ini (log_dir)"
+fi
+# v1.3.0 has log.level in config.json only. The module owns the core's output
+# file, so the level it writes there is a settings.ini knob now; the appended
+# line is the same default the script uses.
+if ! grep -q '^core_log_level=' "$DATA/settings.ini"; then
+    printf '\n# Log level written into config.json at start ("config" = leave it).\ncore_log_level="warn"\n' >> "$DATA/settings.ini"
+    ui_print "  update: settings.ini (core_log_level)"
+fi
+
+# sing-box creates the dashboard inside the directory named by
+# services[].dashboard. Before this version that was run/ (the core's -D), so a
+# relative "dashboard": "ui" left the files in run/ui. The path is now resolved
+# next to config.json, so move the managed copy once instead of downloading it
+# again. An absolute or different path in config.json is left exactly as it is.
+_dash_rel="$(sed -n 's/.*"dashboard"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$DATA/config/config.json" 2>/dev/null | head -n 1)"
+if [ -z "$_dash_rel" ]; then
+    _dash_rel="$(sed -n '/"dashboard"[[:space:]]*:[[:space:]]*{/,/}/s/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$DATA/config/config.json" 2>/dev/null | head -n 1)"
+fi
+if [ "$_dash_rel" = "ui" ] && [ ! -e "$DATA/config/ui" ]; then
+    for _src in "$DATA/run/ui" "$DATA/ui"; do
+        [ -d "$_src" ] || continue
+        if mv -f "$_src" "$DATA/config/ui" 2>/dev/null; then
+            ui_print "  moved : ${_src#"$DATA"/} -> config/ui"
+        fi
+        break
+    done
+fi
+# A leftover managed copy in run/ is not read any more (a relative "ui" now
+# means config/ui) and the dashboard is ~8 MB, so it is not left behind.
+if [ "$_dash_rel" = "ui" ] && [ -d "$DATA/config/ui" ] && [ -d "$DATA/run/ui" ]; then
+    rm -rf "$DATA/run/ui" && ui_print "  removed: stale run/ui (dashboard is config/ui)"
+fi
+
+# The core is the only big file. A thin zip carries none and an existing core is
+# never touched; ASK=1 means "check GitHub", which update-core does with the
+# sha256 from the release API and a `check` against the live config. A failed
+# check/download keeps the bundled or installed core and never aborts the flash.
 core_note() {
     ui_print "  core  : none installed"
     ui_print "  next  : su -c /dev/pi-sing update-core   (then: su -c /dev/pi-sing start)"
 }
 if [ -f "$PAYLOAD/bin/sing-box" ]; then
     cp -f "$PAYLOAD/bin/sing-box" "$DATA/bin/sing-box" || abort "! cannot install bin/sing-box"
-    ui_print "  core  : bundled with this zip"
+    chmod 755 "$DATA/bin/sing-box" 2>/dev/null
+    ui_print "  core  : bundled $("$DATA/bin/sing-box" version 2>/dev/null | head -n 1)"
 elif [ -f "$DATA/bin/sing-box" ]; then
     chmod 755 "$DATA/bin/sing-box" 2>/dev/null
-    ui_print "  core  : kept the one already in ${DATA}/bin"
-else
-    ask_core_download
-    if [ "$ASK" = "1" ]; then
-        ui_print "  core  : downloading the latest sing-box release"
-        if PISING_DIR="$DATA" sh "$DATA/bin/pi-sing" update-core >> "${TMPDIR:-$DATA/run}/pising-core.log" 2>&1 &&
-           [ -x "$DATA/bin/sing-box" ]; then
-            ui_print "  core  : $("$DATA/bin/sing-box" version 2>/dev/null | head -n 1)"
-        else
-            ui_print "  core  : download failed, install continues without a core"
-            tail -n 3 "${TMPDIR:-$DATA/run}/pising-core.log" 2>/dev/null | while IFS= read -r _l; do
-                ui_print "  | $_l"
-            done
-            core_note
-        fi
+    ui_print "  core  : kept $("$DATA/bin/sing-box" version 2>/dev/null | head -n 1)"
+fi
+if [ "$ASK" = "1" ]; then
+    ui_print "  core  : checking the latest sing-box release"
+    if PISING_DIR="$DATA" PISING_QUIET=1 sh "$DATA/bin/pi-sing" update-core >> "$DATA/run/log/module.log" 2>&1 &&
+       [ -x "$DATA/bin/sing-box" ]; then
+        ui_print "  core  : $("$DATA/bin/sing-box" version 2>/dev/null | head -n 1)"
     else
-        core_note
+        ui_print "  core  : update failed, keeping what is installed"
+        tail -n 3 "$DATA/run/log/module.log" 2>/dev/null | while IFS= read -r _l; do
+            ui_print "  | $_l"
+        done
     fi
 fi
+[ -x "$DATA/bin/sing-box" ] || core_note
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/service.sh" 0 0 0755
@@ -250,14 +303,47 @@ rm -rf "$TMPDIR/pising"
 
 # The manager stages a module update and applies its boot scripts only on the
 # next boot. Until then the previous service.sh/action.sh are what run, and they
-# call $DATA/pi-sing, so keep the old names pointing at the new files.
-ln -sf "$DATA/bin/pi-sing" "$DATA/pi-sing"
-ln -sf "$DATA/bin/pi.iptables" "$DATA/pi.iptables"
-ln -sf "$DATA/bin/pi-sing" /dev/pi-sing 2>/dev/null
-ui_print "  links        : pi-sing, pi.iptables -> bin/"
-ui_print "  shortcut     : /dev/pi-sing"
+# call $DATA/pi-sing, so that entry point has to exist now. It is a real wrapper
+# file, not a symlink: a copy/backup that drops links then leaves a working
+# path, and `ls -l` shows a script.
+write_entry() {  # $1 = pi-sing | pi.iptables
+    rm -f "$DATA/$1"
+    {
+        printf '#!/system/bin/sh\n'
+        printf '# Generated by the Pi-Sing installer; the real script is bin/%s.\n' "$1"
+        printf 'exec %s/bin/%s "$@"\n' "$DATA" "$1"
+    } > "$DATA/$1" || abort "! cannot write $DATA/$1"
+    chmod 755 "$DATA/$1"
+}
+write_entry pi-sing
+write_entry pi.iptables
+
+# /dev is a tmpfs and empty after a reboot; service.sh recreates this file. The
+# rm is not cosmetic: v1.3.0 left a symlink here and writing through it would
+# overwrite bin/pi-sing with the wrapper.
+DEV_SHORTCUT=/dev/pi-sing
+rm -f "$DEV_SHORTCUT" 2>/dev/null
+{
+    printf '#!/system/bin/sh\nexec %s/bin/pi-sing "$@"\n' "$DATA"
+} > "$DEV_SHORTCUT" 2>/dev/null && chmod 755 "$DEV_SHORTCUT" 2>/dev/null
+
+# The old layout wrote pi-sing.log (core + module lines), iptables.log and
+# service.log; two of them duplicated stdout. run/log/{module,sing-box}.log is
+# the whole story now.
+rm -f "$DATA/run/pi-sing.log" "$DATA/run/pi-sing.log.1" \
+      "$DATA/run/iptables.log" "$DATA/run/service.log" 2>/dev/null
+
+# Describe the state now, so the manager card does not keep showing "running"
+# for a core that the install just stopped.
+_install_desc="⚪ Installed - reboot to start | sing-box + TPROXY"
+for _prop in "$MODPATH/module.prop" /data/adb/modules/pi-sing/module.prop; do
+    [ -f "$_prop" ] || continue
+    sed -i "s#^description=.*#description=${_install_desc}#" "$_prop" 2>/dev/null
+done
+
 ui_print "  config       : $DATA/config/config.json"
-ui_print "  settings     : $DATA/settings.ini"
-ui_print "  reboot to start (service.sh), then check: su -c /dev/pi-sing status"
-[ -x "$DATA/bin/sing-box" ] || core_note
+ui_print "  dashboard    : $DATA/config/ui (relative path in config.json)"
+ui_print "  logs         : $DATA/run/log/{module,sing-box}.log"
+ui_print "  start now    : su -c /dev/pi-sing start"
+ui_print "  status       : su -c /dev/pi-sing status"
 ui_print " "

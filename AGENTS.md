@@ -53,11 +53,15 @@ module/payload/lists/package.list.cfg   per-app list (uid or package[:user])
 module/payload/lists/ap.list.cfg        interfaces whose ingress is proxied
 tools/fetch-sing-box.sh       pinned release + sha256
 tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip (--thin/--all)
-tests/smoke-check.sh           sh -n on every script + sing-box check on both configs
+tests/smoke-check.sh          sh -n on every script + sing-box check on both configs
 tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (14 assertions)
-tests/installer-test.sh       customize.sh on the host: fresh install, v1.0.0 layout
-                              migration, stale watchdog (SIGTERM ignored), idempotency,
-                              thin zip (no core) with PISING_INSTALL_CORE=0|1
+tests/cli-test.sh             host, stub core: dashboard resolution (relative /
+                              object / absolute), core_log_level, 🟢/🔴 description,
+                              log split/rotation, watchdog vs a user stop (27)
+tests/installer-test.sh       customize.sh on the host: fresh install, wrapper files
+                              (no symlinks), v1.0.0 migration, run/ui -> config/ui,
+                              stale watchdog (SIGTERM ignored), idempotency, volume
+                              keys via a fake getevent, thin zip with/without a core (63)
 tests/update-core-test.sh     update-core against a fake release API served locally:
                               digest, swap + restart, no-op, refusal, rollback, first
                               core on a thin install (no previous binary to back up)
@@ -68,19 +72,32 @@ change in `/data/adb/pi-sing`:
 
 ```
 settings.ini            only real file at the top (defines bin_dir, config_dir,
-                        list_dir, run_dir)
+                        list_dir, run_dir, log_dir)
 bin/                    pi-sing, pi.iptables, sing-box, sing-box.LICENSE
-config/                 config.json, config.example.json
+config/                 config.json, config.example.json, ui/ (dashboard)
 lists/                  package.list.cfg, ap.list.cfg
-run/                    pid, logs, generated lists, sing-box cache (-D run/)
-pi-sing, pi.iptables    symlinks to bin/ -- required until the next reboot,
-                        see the traps below
+run/                    pid, stopped (stop intent), generated lists, cache (-D run/)
+run/log/                module.log, sing-box.log (+.1 each)
+pi-sing, pi.iptables    real wrapper files that exec bin/ -- required until the
+                        next reboot, see the traps below
 ```
 
-`/dev/pi-sing` is a symlink to `bin/pi-sing`. The flat v1.0.0 layout is migrated
-by `customize.sh`, which appends the `*_dir` block to an old `settings.ini`
-(existing values untouched). Without that block `pi-sing`/`pi.iptables` refuse to
-run — deriving `bin_dir` on "/" would be a silent misconfiguration.
+`/dev/pi-sing` is a **real wrapper file**, not a symlink (service.sh recreates it
+each boot because /dev is a tmpfs). The flat v1.0.0 layout is migrated by
+`customize.sh`, which appends the `*_dir`, `log_dir` and `core_log_level` lines to
+an old `settings.ini` (existing values untouched). Without the path block
+`pi-sing`/`pi.iptables` refuse to run — deriving `bin_dir` on "/" would be a silent
+misconfiguration.
+
+**The installer always prints the volume-key prompt** (UP = check GitHub for a
+newer core, DOWN = keep what is bundled/installed, 15 s no key = keep). Never make
+the prompt conditional on a thin zip again: it was invisible on the full zip and
+users reported it as a bug. `PISING_INSTALL_CORE=1|0` answers without a key.
+
+**A relative `services[].dashboard` is resolved next to config.json** (never
+against `-D run/`), an absolute path is used as is. `sync_dashboard` rewrites only
+that value at start; the old `run/ui` copy is moved to `config/ui` by the
+installer. Do not hardcode a ui/ directory anywhere.
 
 ## Rule contract (do not reorder without re-measuring)
 
@@ -114,7 +131,8 @@ Host (this container; kernel has xt_TPROXY, `ip netns` works):
 SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
 SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 14/14 expected
 tests/update-core-test.sh                           # 29/29 expected, no device
-tests/installer-test.sh                             # 44/44 expected, no device
+tests/installer-test.sh                             # 63/63 expected, no device
+tests/cli-test.sh                                   # 27/27 expected, no device
 tools/build.sh --all                                # smoke + full and thin zips
 ```
 
@@ -160,7 +178,23 @@ A useful device check set (all must hold):
 - KernelSU 3.3.1 stages a module update in `/data/adb/modules_update` and applies
   `service.sh`/`action.sh` only on the next boot. Between an in-app upgrade and a
   reboot the previous boot script still runs, which is why `customize.sh` keeps
-  `/data/adb/pi-sing/pi-sing` as a symlink into `bin/`.
+  `/data/adb/pi-sing/pi-sing` as a **real wrapper file** into `bin/` (not a
+  symlink). Never write through an existing `/dev/pi-sing` without `rm -f` first:
+  v1.3.0 left a symlink there and a redirect would overwrite `bin/pi-sing`.
+- **The watchdog restarts a crashed core but must not undo a user stop.** `stop`
+  writes `run/stopped` before killing the core, `start` removes it, and the
+  watchdog loop skips restart *and* rule renewal while it exists. Without the flag,
+  the action button's OFF came back at the next 30 s tick (measured).
+- **`find_pid` must fall back to `pgrep -f "$bin_path"`** when `pidof` finds
+  nothing: pidof matches the kernel comm, which is not `bin_name` for a wrapper.
+- **`--disable-color` is detected, not assumed** (`run --help | grep`), and the log
+  level is written into config.json from `core_log_level` (default `warn`). One
+  INFO line per connection was 4 633 B/min on the device; at warn an idle core
+  writes nothing.
+- **An old `settings.ini` has no `core_log_level`**: resolve the default in a
+  variable (`_lvl="${core_log_level:-warn}"`) before using it under `set -u`, or
+  awk never runs and the config keeps `info` (measured on the first device
+  install).
 
 ## Release
 
@@ -173,5 +207,6 @@ A useful device check set (all must hold):
    (volume keys, `PISING_INSTALL_CORE=1|0` to answer without a key) before
    downloading one with `update-core`.
 4. `SINGBOX_BIN=... tests/netns-tproxy-test.sh` and the device check set above.
+   `tools/build.sh --all` already runs smoke + cli-test + installer-test.
 5. Commit subject: `pi-sing: <what changed>`; body explains the measurement, not
    the intention.

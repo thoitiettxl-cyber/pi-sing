@@ -65,7 +65,8 @@ make_core() {  # $1 = path, $2 = version, $3 = kind
 case "\$1" in
     version) echo "sing-box version $2" ;;
     check)   [ "$3" = badcheck ] && { echo 'FATAL decode config: bad' >&2; exit 1; }; exit 0 ;;
-    run)     [ "$3" = crash ] && exit 1
+    run)     [ "\$2" = "--help" ] && { echo "      --disable-color   disable color output"; exit 0; }
+             [ "$3" = crash ] && exit 1
              while :; do sleep 0.5; done ;;
     *)       exit 0 ;;
 esac
@@ -170,13 +171,13 @@ install_cli
 start_server
 PISING_DIR="$DATA" sh "$DATA/bin/pi-sing" start >"${TMP}/start.log" 2>&1
 core_running && ok "stub core 1.0.0 running before the update" ||
-    { bad "stub core did not start"; cat "${TMP}/start.log"; cat "${DATA}/run/pi-sing.log"; exit 1; }
+    { bad "stub core did not start"; cat "${TMP}/start.log"; cat "${DATA}/run/log/module.log"; exit 1; }
 
 echo "== update to the latest release"
 publish 9.9.9 rel-latest ok
 cli rel-latest.json update-core >"${TMP}/out1" 2>&1
 eq "$?" 0 "update-core exits 0"
-LOG="${DATA}/run/pi-sing.log"
+LOG="${DATA}/run/log/module.log"
 has "$LOG" "update: sha256 ok" "digest from the API is verified"
 has "$LOG" "update: core 1.0.0 -> 9.9.9 (android-arm64)" "log records the version change"
 eq "$(core_version)" "9.9.9" "bin/sing-box is the new core"
