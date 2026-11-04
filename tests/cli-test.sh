@@ -38,7 +38,8 @@ cleanup() {
 trap cleanup EXIT
 
 cli() {  # CLI with the test's data dir and a module.prop to write
-    PISING_DIR="$DATA" PISING_MOD_DIR="$MOD" PISING_QUIET=1 sh "$DATA/bin/pi-sing" "$@"
+    PATH="${TMP}/fakebin:$PATH" PISING_DIR="$DATA" PISING_MOD_DIR="$MOD" PISING_QUIET=1 \
+        sh "$DATA/bin/pi-sing" "$@"
 }
 
 write_config() {  # $1 = dashboard JSON value (empty = no dashboard key)
@@ -63,11 +64,29 @@ reset() {  # clean runtime state between cases
 }
 
 # ------------------------------------------------------------------ sandbox
-mkdir -p "$DATA/bin" "$DATA/config" "$DATA/lists" "$DATA/run" "$MOD"
+mkdir -p "$DATA/bin" "$DATA/config" "$DATA/lists" "$DATA/run" "$MOD" "${TMP}/fakebin"
 cp "${ROOT}/module/payload/bin/pi-sing" "$DATA/bin/pi-sing"
 chmod 755 "$DATA/bin/pi-sing"
-printf '#!/bin/sh\nexit 0\n' > "$DATA/bin/pi.iptables"
+# The rule set is one marker file, and `iptables -S` reports it: the module card
+# is derived from the real state, so a start without rules is not "running".
+cat > "$DATA/bin/pi.iptables" <<EOF
+#!/bin/sh
+case "\$1" in
+    on|renew) : > "${TMP}/rules.on" ;;
+    off)      rm -f "${TMP}/rules.on" ;;
+esac
+exit 0
+EOF
 chmod 755 "$DATA/bin/pi.iptables"
+cat > "${TMP}/fakebin/iptables" <<EOF
+#!/bin/sh
+case " \$* " in
+    *" -S OUTPUT "*)     [ -f "${TMP}/rules.on" ] && echo "-A OUTPUT -j PISING_LOCAL" ;;
+    *" -S PREROUTING "*) [ -f "${TMP}/rules.on" ] && echo "-A PREROUTING -j PISING_EXT" ;;
+esac
+exit 0
+EOF
+chmod 755 "${TMP}/fakebin/iptables"
 cp "${ROOT}/module/payload/settings.ini" "$DATA/settings.ini"
 cat >> "$DATA/settings.ini" <<'EOF'
 
@@ -180,6 +199,9 @@ cli start >/dev/null 2>&1
 cli watchdog >/dev/null 2>&1 &
 WPID=$!
 sleep 1
+# `cli watchdog &` backgrounds a subshell; the loop itself is its child, and it
+# ignores SIGTERM, so kill it by command line (same as the device notes).
+WPID="$(pgrep -f "$DATA/bin/pi-sing watchdog" 2>/dev/null | head -n 1)"
 cli stop >/dev/null 2>&1
 sleep 3
 cli status | grep -q '^process    : running' && bad "the watchdog restarted a user-stopped core" ||
@@ -188,8 +210,24 @@ cli status | grep -q '^process    : running' && bad "the watchdog restarted a us
 cli start >/dev/null 2>&1
 [ -f "$DATA/run/stopped" ] && bad "start did not clear the stop intent" || ok "start clears the stop intent"
 kill -9 "$WPID" 2>/dev/null
-wait "$WPID" 2>/dev/null
+for _p in $(pgrep -f "$DATA/bin/pi-sing watchdog" 2>/dev/null); do kill -9 "$_p" 2>/dev/null; done
 sed -i 's/^watchdog_interval=.*/watchdog_interval=30/' "$DATA/settings.ini"
+
+echo "== a process that only mentions the core path is not the core"
+# Measured on the device: the container shares the phone's PID namespace, so a
+# shell whose command line contained bin_path looked like a running core and
+# `stop` killed it (the agent's own shell got SIGKILLed). Only an argv token
+# together with the executable or argv[0]/argv[1] counts as the core.
+reset
+sh -c 'sleep 30' "$DATA/bin/sing-box" /tmp/decoy &
+DECOY=$!
+sleep 0.3
+cli status > "${TMP}/decoy.out" 2>&1
+has "${TMP}/decoy.out" "process    : stopped" "a decoy that mentions the path is not the core"
+cli stop >/dev/null 2>&1
+kill -0 "$DECOY" 2>/dev/null && ok "stop left the decoy alone" || bad "stop killed an unrelated process"
+kill -9 "$DECOY" 2>/dev/null
+wait "$DECOY" 2>/dev/null
 
 echo "== module.log rotates at 256 KiB"
 reset

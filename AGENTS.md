@@ -57,17 +57,21 @@ tests/smoke-check.sh          sh -n on every script + sing-box check on both con
 tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (14 assertions)
 tests/cli-test.sh             host, stub core: dashboard resolution (relative /
                               object / absolute), core_log_level, 🟢/🔴 description,
-                              log split/rotation, watchdog vs a user stop (27)
+                              log split/rotation, watchdog vs a user stop, a decoy
+                              process that mentions bin_path is not the core (29)
 tests/action-test.sh          host: fail-closed state (rules stay, core dies) and
                               the action button's one-press OFF, the 🟠 card, the
-                              watchdog not repainting 🟢 over it (24)
+                              watchdog not repainting 🟢 over it, a core that dies
+                              during the probes taking the rules with it (28)
 tests/installer-test.sh       customize.sh on the host: fresh install, wrapper files
                               (no symlinks), v1.0.0 migration, run/ui -> config/ui,
                               stale watchdog (SIGTERM ignored), idempotency, volume
-                              keys via a fake getevent, thin zip with/without a core (63)
+                              keys via a fake getevent (wall-clock window, drained
+                              queue), thin zip with/without a core (66)
 tests/update-core-test.sh     update-core against a fake release API served locally:
                               digest, swap + restart, no-op, refusal, rollback, first
-                              core on a thin install (no previous binary to back up)
+                              core on a thin install (no previous binary to back up),
+                              update_mirror rewriting only github URLs (38)
 ```
 
 On the device: module scripts in `/data/adb/modules/pi-sing`, everything that can
@@ -95,7 +99,15 @@ misconfiguration.
 **The installer always prints the volume-key prompt** (UP = check GitHub for a
 newer core, DOWN = keep what is bundled/installed, 15 s no key = keep). Never make
 the prompt conditional on a thin zip again: it was invisible on the full zip and
-users reported it as a bug. `PISING_INSTALL_CORE=1|0` answers without a key.
+users reported it as a bug. `PISING_INSTALL_CORE=1|0` answers without a key and
+`PISING_KEY_WAIT=<s>` shortens the window (tests).
+
+The wait is a **wall-clock deadline**, and the input queue is drained before the
+prompt is printed. `getevent -lqc 1` returns on the first event of *any* kind and
+this phone streams touch/nav events, so counting reads made the advertised 15 s
+last ~2.4 s (measured: 5 reads = 787 ms); a volume key pressed to scroll the
+manager log would answer a question the user has not read yet. Same shape as
+`box_for_magisk` (`date +%s` deadline, drain in front of every prompt).
 
 **A relative `services[].dashboard` is resolved next to config.json** (never
 against `-D run/`), an absolute path is used as is. `sync_dashboard` rewrites only
@@ -133,10 +145,10 @@ Host (this container; kernel has xt_TPROXY, `ip netns` works):
 ```
 SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
 SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 14/14 expected
-tests/update-core-test.sh                           # 29/29 expected, no device
-tests/installer-test.sh                             # 63/63 expected, no device
-tests/cli-test.sh                                   # 27/27 expected, no device
-tests/action-test.sh                                # 24/24 expected, no device
+tests/update-core-test.sh                           # 38/38 expected, no device
+tests/installer-test.sh                             # 66/66 expected, no device
+tests/cli-test.sh                                   # 29/29 expected, no device
+tests/action-test.sh                                # 28/28 expected, no device
 tools/build.sh --all                                # smoke + full and thin zips
 ```
 
@@ -189,6 +201,16 @@ A useful device check set (all must hold):
   writes `run/stopped` before killing the core, `start` removes it, and the
   watchdog loop skips restart *and* rule renewal while it exists. Without the flag,
   the action button's OFF came back at the next 30 s tick (measured).
+- **The rules must not outlive the core.** A killed core with the rules still
+  installed captures every packet to a dead port: the phone is offline until
+  somebody runs `stop`, and on a config the core cannot survive that looks like
+  "the action button is broken" (measured: `kill -9` the core with rules in place,
+  `curl 1.1.1.1` on the phone rc 35 with the card still 🟠). `do_start` and the
+  watchdog call `drop_rules_if_dead` after any failed attempt, and the card is
+  derived from the real state (`update_state`), never from what the caller hoped.
+  Same rule as `box_for_magisk` (`box_bin_alive` / `restart_box`: no pid →
+  `iptables disable`). A *live* core with a dead tunnel still keeps the rules (no
+  leak); the action button's single press is the way out.
 - **"ON" means the TPROXY rules are installed, not just "a core is running".** A
   start whose self-test fails keeps the rules (fail closed, no leak) and the core
   can exit a moment later, so `process : stopped` + `iptables : hooked` is a
@@ -199,6 +221,13 @@ A useful device check set (all must hold):
   the card 🟠 so the watchdog cannot paint it 🟢 while the tunnel is unproven.
 - **`find_pid` must fall back to `pgrep -f "$bin_path"`** when `pidof` finds
   nothing: pidof matches the kernel comm, which is not `bin_name` for a wrapper.
+  The pgrep hit alone is not enough — `is_core_pid` also requires bin_path as an
+  argv token of that pid plus `/proc/<pid>/exe` (or argv[0]/argv[1]). Measured:
+  the Droidspaces container **shares the phone's PID namespace**, so a shell whose
+  command line mentioned `/data/adb/pi-sing/bin/sing-box` was taken for the core
+  and `stop` SIGKILLed it (the agent's own shell, exit 137). Never `pkill -f` a
+  path from a bridge command either: the pattern matches the command you are
+  running.
 - **`--disable-color` is detected, not assumed** (`run --help | grep`), and the log
   level is written into config.json from `core_log_level` (default `warn`). One
   INFO line per connection was 4 633 B/min on the device; at warn an idle core

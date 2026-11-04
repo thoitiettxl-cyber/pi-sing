@@ -239,6 +239,67 @@ eq "$(core_version)" "9.9.13" "bin/sing-box created from the release"
 [ -e "${DATA}/run/update" ] && bad "scratch dir run/update was left behind" ||
     ok "scratch dir run/update removed"
 
+echo "== update_mirror prefixes github URLs and nothing else"
+# A fake curl records the URL it was asked for, answers the release API with a
+# canned JSON and refuses the tarball: enough to see both GitHub URLs go through
+# the mirror, that the failure is reported, and that no partial file is left.
+mkdir -p "${TMP}/fakecurl"
+cat > "${TMP}/fakecurl/curl" <<EOF
+#!/bin/sh
+_out=""
+_url=""
+_next=0
+for _a in "\$@"; do
+    case "\$_a" in
+        -o) _next=1 ;;
+        -*) ;;
+        *)  if [ "\$_next" = 1 ]; then _out="\$_a"; _next=0; else _url="\$_a"; fi ;;
+    esac
+done
+echo "\$_url" >> "${TMP}/curl.urls"
+case "\$_url" in
+    */releases/latest) cat "${DOC}/rel-mirror.json" > "\$_out"; exit 0 ;;
+    *) exit 22 ;;
+esac
+EOF
+chmod 755 "${TMP}/fakecurl/curl"
+cat > "${DOC}/rel-mirror.json" <<'JSON'
+{
+  "tag_name": "v9.9.14",
+  "assets": [
+    {
+      "name": "sing-box-9.9.14-android-arm64.tar.gz",
+      "state": "uploaded",
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ]
+}
+JSON
+: > "${TMP}/curl.urls"
+sed -i 's|^update_mirror=.*|update_mirror="https://mirror.test"|' "$DATA/settings.ini"
+PATH="${TMP}/fakecurl:$PATH" PISING_DIR="$DATA" PISING_UPDATE_ARCH=arm64 \
+    sh "$DATA/bin/pi-sing" update-core >"${TMP}/out8" 2>&1
+[ "$?" -ne 0 ] && ok "a refused download fails the update" || bad "the update claimed success"
+grep -qF "https://mirror.test/https://api.github.com/repos/SagerNet/sing-box/releases/latest" "${TMP}/curl.urls" &&
+    ok "the release API goes through the mirror" || bad "the API URL was not mirrored"
+grep -qF "https://mirror.test/https://github.com/SagerNet/sing-box/releases/download/v9.9.14/sing-box-9.9.14-android-arm64.tar.gz" "${TMP}/curl.urls" &&
+    ok "the tarball goes through the mirror" || bad "the download URL was not mirrored"
+has "$LOG" "update: using mirror https://mirror.test/https://api.github.com/" "the mirror is logged"
+has "$LOG" "update: download failed" "the download failure is reported"
+[ -n "$(find "${DATA}/run/update" -name '*.tar.gz' 2>/dev/null)" ] &&
+    bad "a partial tarball was left in run/update" || ok "no partial tarball in run/update"
+eq "$(core_version)" "9.9.13" "previous binary untouched"
+sed -i 's|^update_mirror=.*|update_mirror=""|' "$DATA/settings.ini"
+
+echo "== without a mirror the URLs are untouched"
+: > "${TMP}/curl.urls"
+PATH="${TMP}/fakecurl:$PATH" PISING_DIR="$DATA" PISING_UPDATE_ARCH=arm64 \
+    sh "$DATA/bin/pi-sing" update-core >"${TMP}/out9" 2>&1
+grep -qF "https://api.github.com/repos/SagerNet/sing-box/releases/latest" "${TMP}/curl.urls" &&
+    ok "the plain API URL is used" || bad "the API URL was rewritten without a mirror"
+grep -qF "mirror.test" "${TMP}/curl.urls" && bad "a mirror leaked into the direct run" ||
+    ok "no mirror prefix without update_mirror"
+
 echo
 [ "$FAIL" -eq 0 ] && echo "update-core test: pass ($PASS checks)" ||
     { echo "update-core test: ${FAIL} failure(s)"; exit 1; }

@@ -16,6 +16,7 @@
 #   1. a failed proxied probe keeps the rules and says 🟠 Tunnel down
 #   2. status reports the core and the rules separately
 #   3. the action button turns a dead-core rule set OFF (one press)
+#   3b. a start whose core dies while the probes run drops the rules itself
 #   4. the action button starts again from a clean OFF
 #   5. the watchdog does not repaint the card 🟢 over a failed self-test
 #   6. a start whose self-test passes clears the marker and says 🟢
@@ -40,6 +41,11 @@ hasnt() { grep -qF "$2" "$1" 2>/dev/null && bad "$3 ('$2' in $1)" || ok "$3"; }
 
 cleanup() {
     PISING_DIR="$DATA" PATH="$FAKE:$PATH" sh "$DATA/bin/pi-sing" stop >/dev/null 2>&1
+    # The watchdog is a loop that ignores SIGTERM (measured on the device), and
+    # `cli watchdog &` backgrounds a subshell, so $! is not the loop itself.
+    for _p in $(pgrep -f "$DATA/bin/pi-sing watchdog" 2>/dev/null); do
+        kill -9 "$_p" 2>/dev/null
+    done
     [ -n "${WPID:-}" ] && kill -9 "$WPID" 2>/dev/null
     [ "${FAIL:-1}" -eq 0 ] && rm -rf "$TMP" || printf '  ---- kept %s\n' "$TMP"
 }
@@ -159,11 +165,15 @@ echo "== the watchdog does not repaint the card 🟢 over a failed self-test"
 sed -i 's/^watchdog=.*/watchdog=1/; s/^watchdog_interval=.*/watchdog_interval=1/' "$DATA/settings.ini"
 cli watchdog >/dev/null 2>&1 &
 WPID=$!
-sleep 2.5
+sleep 1
+# The loop, not the subshell that started it: otherwise it keeps restarting the
+# core through the rest of the test.
+WPID="$(pgrep -f "$DATA/bin/pi-sing watchdog" 2>/dev/null | head -n 1)"
+sleep 1.5
 eq "$(card)" "description=🟠 Tunnel down - tap to stop | sing-box + TPROXY blacklist, 1536" \
    "the watchdog tick keeps the 🟠 state"
 kill -9 "$WPID" 2>/dev/null
-wait "$WPID" 2>/dev/null
+sleep 0.2
 WPID=""
 sed -i 's/^watchdog=.*/watchdog=0/; s/^watchdog_interval=.*/watchdog_interval=30/' "$DATA/settings.ini"
 
@@ -173,6 +183,30 @@ eq "$?" "0" "restart succeeds when both probes pass"
 [ -f "$DATA/run/selftest.failed" ] && bad "the marker survived a passing self-test" || ok "the passing self-test cleared the marker"
 eq "$(card)" "description=🟢 Running (pid $(cat "$DATA/run/pi-sing.pid")) | sing-box + TPROXY blacklist, 1536" \
    "the card is 🟢 after a passing self-test"
+
+echo "== a core that dies while the probes run takes the rules with it"
+# The rules must never outlive the core (box_for_magisk: no pid -> iptables
+# disable): a captured packet with nobody listening is a phone with no internet.
+cli stop >/dev/null 2>&1
+rm -f "$DATA/run/stopped"
+cat > "$DATA/bin/sing-box" <<'EOF'
+#!/bin/sh
+case "$1" in
+    version) echo "sing-box version 9.9.9" ;;
+    check)   exit 0 ;;
+    run)     sleep 0.7; exit 1 ;;   # dies after the rules are in, before the probe
+    *)       exit 0 ;;
+esac
+EOF
+chmod 755 "$DATA/bin/sing-box"
+probes
+cli start >/dev/null 2>&1
+eq "$?" "1" "start reports the failure"
+[ -f "${TMP}/rules.on" ] && bad "the rules outlived the core" || ok "the rules were dropped with the core"
+eq "$(card)" "description=🔴 Stopped - tunnel down | sing-box + TPROXY blacklist, 1536" \
+   "the card says the proxy is off, not that it is running"
+has "$DATA/run/log/module.log" "removing the TPROXY rules so the phone keeps its connection" \
+   "the reason is in module.log"
 
 echo "== a status with half the rule set installed still counts as hooked"
 rm -f "${TMP}/rules.on"

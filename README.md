@@ -36,19 +36,25 @@ Host-side tests, run on the same kernel:
 tests/smoke-check.sh                  every script parses (dash), both configs pass `sing-box check` 1.14.4
 tests/netns-tproxy-test.sh            14/14 — TCP, UDP/53 hijack, per-app blacklist + whitelist,
                                       core-gid bypass (no capture loop), clean teardown
-tests/cli-test.sh                     27/27 — dashboard resolution (relative/object/absolute),
+tests/cli-test.sh                     29/29 — dashboard resolution (relative/object/absolute),
                                       core_log_level, 🟢/🔴 description, log split, log rotation,
-                                      watchdog leaves a user-stopped core stopped
-tests/installer-test.sh               63/63 — fresh install, wrapper files (no symlinks),
+                                      watchdog leaves a user-stopped core stopped, a process
+                                      that only mentions the core path is not the core
+tests/action-test.sh                  28/28 — fail-closed state (rules stay, core dies), the
+                                      action button's one-press OFF, the 🟠 card, the watchdog
+                                      not repainting 🟢, a core that dies during the probes
+                                      taking the rules with it
+tests/installer-test.sh               66/66 — fresh install, wrapper files (no symlinks),
                                       migration from the v1.0.0 flat layout, run/ui move,
                                       idempotent re-run, stale watchdog killed, volume-key
-                                      prompt (+) / (-), thin zip with no core, failed
-                                      download, old settings.ini rejected
-tests/update-core-test.sh             29/29 — update-core against a fake release API: digest
+                                      prompt (+) / (-) on a wall-clock window, thin zip with no
+                                      core, failed download, old settings.ini rejected
+tests/update-core-test.sh             38/38 — update-core against a fake release API: digest
                                       verified, swap + restart, "already latest" no-op,
                                       bad digest / failing `check` / dead core refused,
                                       previous binary restored and restarted, first core
-                                      on a thin install (no previous binary)
+                                      on a thin install (no previous binary), update_mirror
+                                      rewriting only github URLs
 ```
 
 Not verified: the `ipv6=proxy` mode (this tunnel carries IPv4 only — measured),
@@ -182,10 +188,14 @@ OFF was undone at the next 30 s tick.
   Every state change writes one line, the way
   [`android-bridge`](https://github.com/ravindu644/android-bridge) does:
   `🟢 Running (pid …) | sing-box + TPROXY blacklist, 1536`,
-  `🔴 Stopped`, `🟠 Tunnel down - tap to stop` (rules stay, fail closed),
-  `🟠 Rules off (selftest)`, `🔴 Config error`, `🔴 No core`,
+  `🔴 Stopped`, `🔴 Stopped - tunnel down`, `🟠 Tunnel down - tap to stop`
+  (core up, rules stay: fail closed), `🟠 Core down - tap to stop`,
+  `🟠 Running - no rules`, `🔴 Config error`, `🔴 No core`,
   `🔴 Disabled (enabled=0)`, `⚪ Installed - reboot to start`.
-  The watchdog only rewrites the file when the state changes.
+  Every state-changing path derives the line from what is true at that moment
+  (process alive? rules installed? last self-test unproven?), so the card cannot
+  claim a state the phone is not in. The watchdog only rewrites the file when
+  the text changes.
 - **`run/log/module.log`** — one line per module event, `[cli]` or `[rules]` or
   `[svc]` + level + timestamp. Rotates at 256 KiB to `.1`.
 - **`run/log/sing-box.log`** — the core's stdout/stderr only (started with
@@ -228,6 +238,14 @@ state, so the watchdog cannot repaint the card `🟢`; the next start that passe
 clears it. Both failing means the rules themselves are wrong → they are removed
 so the phone keeps its connection. `selftest=0` disables it.
 
+The rules **never outlive the core**: a start or restart that ends without a
+running core drops them and logs why (`removing the TPROXY rules so the phone
+keeps its connection`). A captured packet with nobody listening is a phone with
+no internet, and that state used to survive until somebody ran `stop`. The same
+rule as `box_for_magisk`'s `box_bin_alive` / `restart_box` (no pid → `iptables
+disable`); the difference is that a *live* core with a dead tunnel still keeps
+the rules (no leak), and then the action button's one press is the way out.
+
 ## Updating the core
 
 `pi-sing update-core` installs the latest sing-box release; the module does not
@@ -249,6 +267,12 @@ have to be rebuilt or reinstalled.
   nothing to back up, so the release is installed from scratch;
 - same tag as the installed core -> `update: already on the latest core (1.14.4)`,
   nothing is downloaded;
+- `update_mirror` (settings.ini) puts an accelerator in front of github.com
+  (`https://ghfast.top` style): `https://github.com/…`, `https://api.github.com/…`
+  and `https://raw.githubusercontent.com/…` get the prefix, nothing else does. A
+  partial download is deleted, never left in `run/update`. The digest still comes
+  from the release API, so a truncated download is refused — but the mirror
+  answers that API too, so only use one you trust;
 - unauthenticated GitHub API access is limited to 60 requests/hour per IP; a 403
   leaves the API body in `run/update/release.json` and the core untouched.
 
@@ -276,6 +300,7 @@ unchanged.
 | `ignore_interfaces` | empty | output interfaces that are never proxied |
 | `core_user`/`core_group`/`core_gid` | `root`/`net_admin`/`3005` | the core runs as this uid:gid so its own traffic can be bypassed by gid |
 | `core_log_level` | `warn` | level written into `config.json` at start; `config`/empty leaves the file in charge. `warn` keeps one line per connection out of the log |
+| `update_mirror` | empty | accelerator prefix for github.com in `update-core` and the installer's download, e.g. `https://ghfast.top` (empty = direct) |
 | `log_dir` | `${run_dir}/log` | `module.log` and `sing-box.log` (+`.1`) |
 
 ## Rule set (mangle)

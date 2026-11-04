@@ -292,6 +292,35 @@ grep -q 'keys   : (-) pressed' "${TMP}/log-keydown" && ok "the (-) key is detect
 grep -q 'update: ' "$DATA/run/log/module.log" 2>/dev/null && bad "(-) still ran update-core" ||
     ok "(-) did not contact GitHub"
 
+echo "== a burst of non-key input does not shorten the prompt window"
+# `getevent -lqc 1` returns on the first event of any kind, and this phone
+# streams touch/nav events (measured: 5 reads = 787 ms), so a loop that counts
+# reads ran its 15 iterations in ~2.4 s while promising 15 s. The wait has to be
+# a wall-clock deadline: with an input device that never sends a volume key the
+# old loop answered after exactly 15 reads, the new one reads until the deadline.
+mkdir -p "${TMP}/keyburst"
+: > "${TMP}/keyburst.calls"
+cat > "${TMP}/keyburst/getevent" <<EOF
+#!/bin/sh
+echo x >> "${TMP}/keyburst.calls"
+echo "    /dev/input/event7: EV_ABS       ABS_MT_POSITION_Y    0000991f"
+exit 0
+EOF
+chmod 755 "${TMP}/keyburst/getevent"
+DATA="${TMP}/keys"
+(
+    unset PISING_INSTALL_CORE
+    PATH="${TMP}/keyburst:$PATH" PISING_KEY_WAIT=2 \
+        install_into "$DATA" "${TMP}/mod-keys" keys "$Z_THIN"
+) || { echo; echo "installer test: abort"; exit 1; }
+_calls="$(wc -l < "${TMP}/keyburst.calls" | tr -d ' ')"
+[ "$_calls" -gt 20 ] && ok "the prompt waited on the clock, not on the read count (${_calls} reads)" ||
+    bad "the prompt gave up after ${_calls} reads"
+grep -q 'Volume keys (2 s)' "${TMP}/log-keys" && ok "the prompt prints the window it really uses" ||
+    bad "the prompt does not print the window"
+grep -q 'keys   : no key pressed' "${TMP}/log-keys" && ok "no key -> keep, the flash goes on" ||
+    bad "the no-input answer was not reported"
+
 echo "== pi-sing refuses a pre-v1.1.0 settings.ini"
 OLD="${TMP}/old"
 mkdir -p "$OLD/run" "$OLD/bin"

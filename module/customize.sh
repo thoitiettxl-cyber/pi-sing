@@ -75,19 +75,30 @@ stop_watchdog
 # ---------------------------------------------------------------- core choice
 # One question, always asked, whatever the zip carries: check GitHub for a newer
 # core, or keep the core in this zip / on the phone. The manager installer has no
-# TTY, so the answer comes from the volume keys. `getevent -lqc 1` blocks until
-# one event, so `timeout 1` around it is a bounded wait; /dev/input is not
-# readable in every installer context, and then the default (keep) is taken
-# instead of hanging. The flash itself never fails because of this.
+# TTY, so the answer comes from the volume keys.
+#
+# The wait is a wall-clock deadline, not a number of reads: `getevent -lqc 1`
+# returns on *any* input event (this phone streams touch/nav events), so counting
+# iterations made the advertised 15 s last ~2.4 s (measured: 5 reads = 787 ms).
+# box_for_magisk loops against `date +%s` for the same reason.
+#
+# Anything queued before the prompt is drained first, or a volume key pressed to
+# scroll the manager log answers a question the user has not read yet.
+# /dev/input is not readable in every installer context; then the default (keep)
+# is taken instead of hanging. The flash itself never fails because of this.
+flush_keys() {
+    timeout 1 getevent -ql >/dev/null 2>&1
+    return 0
+}
+
 read_volume_key() {  # $1 = seconds to wait -> "up" | "down" | nothing
-    _left="$1"
-    while [ "$_left" -gt 0 ]; do
+    _until=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "$_until" ]; do
         _ev="$(timeout 1 getevent -lqc 1 2>/dev/null)"
         case "$_ev" in
             *KEY_VOLUMEUP*) printf 'up'; return 0 ;;
             *KEY_VOLUMEDOWN*) printf 'down'; return 0 ;;
         esac
-        _left=$((_left - 1))
     done
     return 1
 }
@@ -103,20 +114,25 @@ ask_core_update() {
         1|yes|download|update) ASK=1; ui_print "  keys   : (+) update selected (PISING_INSTALL_CORE)"; return 0 ;;
         0|no|keep|skip)        ui_print "  keys   : (-) keep selected (PISING_INSTALL_CORE)"; return 0 ;;
     esac
-    ui_print " "
-    ui_print "  Volume keys (15 s):"
-    ui_print "    (+) UP   = download the latest sing-box core from GitHub"
-    ui_print "    (-) DOWN = keep the core in this zip / already on the phone"
-    ui_print "    no key   = keep"
     if ! command -v getevent >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
         ui_print "  keys   : no key input here, keeping the current core"
         return 0
     fi
-    case "$(read_volume_key 15)" in
+    # PISING_KEY_WAIT is the same question with a shorter window (automation).
+    _wait="${PISING_KEY_WAIT:-15}"
+    case "$_wait" in ""|*[!0-9]*) _wait=15 ;; esac
+    flush_keys
+    ui_print " "
+    ui_print "  Volume keys (${_wait} s):"
+    ui_print "    (+) UP   = download the latest sing-box core from GitHub"
+    ui_print "    (-) DOWN = keep the core in this zip / already on the phone"
+    ui_print "    no key   = keep"
+    case "$(read_volume_key "$_wait")" in
         up)   ASK=1; ui_print "  keys   : (+) pressed - checking GitHub for a newer core" ;;
         down) ASK=0; ui_print "  keys   : (-) pressed - keeping the current core" ;;
         *)    ASK=0; ui_print "  keys   : no key pressed - keeping the current core" ;;
     esac
+    flush_keys
     return 0
 }
 

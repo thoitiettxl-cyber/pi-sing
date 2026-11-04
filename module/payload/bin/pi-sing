@@ -72,6 +72,23 @@ find_busybox() {
     return 1
 }
 
+# A candidate is the core only when bin_path is one of its own argv tokens and is
+# either its executable (the ELF case, also under `busybox setuidgid` /
+# `setpriv`) or the script it was launched as (argv[0], or `sh <script>...`).
+# A pgrep match alone is not enough: on this phone the container shares the PID
+# namespace, so a test command whose text merely mentions bin_path looked like a
+# running core, and `stop` killed it (measured: the agent's own shell got
+# SIGKILLed by the module).
+is_core_pid() {  # $1 = pid
+    _x="$(readlink "/proc/${1}/exe" 2>/dev/null)"
+    [ "${_x% (deleted)}" = "$bin_path" ] && return 0
+    # shellcheck disable=SC2046
+    set -- $(tr '\0' ' ' < "/proc/${1}/cmdline" 2>/dev/null)
+    [ "${1:-}" = "$bin_path" ] && return 0
+    [ "${2:-}" = "$bin_path" ] && return 0
+    return 1
+}
+
 find_pid() {
     if command -v pidof >/dev/null 2>&1; then
         _p="$(pidof "$bin_name" 2>/dev/null | awk '{ print $1 }')"
@@ -81,12 +98,23 @@ find_pid() {
         fi
     fi
     # pidof matches the kernel's comm, which is not bin_name when the core is a
-    # wrapper (or was renamed); the full command line still contains bin_path.
+    # script (or was renamed); the full command line still contains bin_path.
     if command -v pgrep >/dev/null 2>&1; then
-        pgrep -f "$bin_path" 2>/dev/null | head -n 1
-    else
-        ps -A 2>/dev/null | awk -v b="$bin_path" 'index($0, b) { print $2; exit }'
+        for _cand in $(pgrep -f "$bin_path" 2>/dev/null); do
+            if is_core_pid "$_cand"; then
+                printf '%s' "$_cand"
+                return 0
+            fi
+        done
+        return 1
     fi
+    for _cand in $(ps -A 2>/dev/null | awk -v b="$bin_path" 'index($0, b) { print $2 }'); do
+        if is_core_pid "$_cand"; then
+            printf '%s' "$_cand"
+            return 0
+        fi
+    done
+    return 1
 }
 
 running_pid() {
@@ -113,6 +141,51 @@ update_desc() {
     return 0
 }
 
+# True when pi.iptables' hooks are in place. Both chains count: a half-removed
+# rule set still captures DNS in PREROUTING, so it must not read as "off".
+rules_hooked() {
+    iptables -t mangle -S PREROUTING 2>/dev/null | grep -qF PISING_EXT && return 0
+    iptables -t mangle -S OUTPUT 2>/dev/null | grep -qF PISING_LOCAL && return 0
+    return 1
+}
+
+# The card line is derived from what is true right now instead of from what the
+# caller hoped, so no code path can leave a state on the card that the phone is
+# not in (green "Running" over a dead tunnel, "Stopped" while the rules still
+# capture every packet).
+update_state() {
+    _p="$(running_pid)"
+    if [ -n "${_p:-}" ] && rules_hooked; then
+        if [ -f "$selftest_failed_file" ]; then
+            update_desc "🟠 Tunnel down - tap to stop"
+        else
+            update_desc "🟢 Running (pid ${_p})"
+        fi
+    elif [ -n "${_p:-}" ]; then
+        update_desc "🟠 Running - no rules"
+    elif rules_hooked; then
+        update_desc "🟠 Core down - tap to stop"
+    elif [ -f "$selftest_failed_file" ]; then
+        update_desc "🔴 Stopped - tunnel down"
+    else
+        update_desc "🔴 Stopped"
+    fi
+    return 0
+}
+
+# The rules must never outlive the core: a dead core cannot answer the TPROXY
+# socket, so every packet is captured and dropped and the phone stays offline
+# until somebody runs `stop` (in the reported case: until the module was
+# uninstalled). A start/restart that leaves no core drops the rules instead;
+# box_for_magisk does the same in box_bin_alive/restart_box (no pid -> disable).
+drop_rules_if_dead() {
+    [ -z "$(running_pid)" ] || return 0
+    rules_hooked || return 0
+    log Warn "sing-box is not running: removing the TPROXY rules so the phone keeps its connection"
+    PISING_QUIET=1 "${bin_dir}/pi.iptables" off >/dev/null 2>&1
+    update_state
+    return 0
+}
 # Sets _dash_line/_dash_old/_dash_new from services[].dashboard. A relative path
 # is resolved next to config.json, never against -D run/: the dashboard files
 # belong with the config that names them. An absolute path is used untouched.
@@ -238,8 +311,9 @@ http_probe() {  # $1 = url, $2 = optional command prefix ("busybox setuidgid 0:3
 # fail, the rules themselves are broken and are removed so the phone keeps its
 # connection.
 selftest() {
-    [ "${selftest:-0}" = "1" ] || return 0
+    [ "${selftest:-0}" = "1" ] || { rm -f "$selftest_failed_file"; return 0; }
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        rm -f "$selftest_failed_file"
         log Warn "selftest skipped: no curl/wget on the device"
         return 0
     fi
@@ -266,13 +340,13 @@ selftest() {
         : > "$selftest_failed_file"
         log Warn "selftest: proxied path failed, tunnel is down (rules kept, fail closed)"
         log Warn "the phone is offline until the tunnel is fixed: tap the action button or run 'pi-sing stop'"
-        update_desc "🟠 Tunnel down - tap to stop"
+        update_state
         return 1
     fi
     rm -f "$selftest_failed_file"
     log Error "selftest: both paths failed, removing the rules to keep the phone online"
     "${bin_dir}/pi.iptables" off >/dev/null 2>&1
-    update_desc "🟠 Rules off (selftest)"
+    update_state
     return 1
 }
 
@@ -409,11 +483,7 @@ do_start() {
     if [ -n "${_running:-}" ]; then
         printf '%s\n' "$_running" > "$pid_file"
         log Info "already running (pid ${_running})"
-        if [ -f "$selftest_failed_file" ]; then
-            update_desc "🟠 Tunnel down - tap to stop"
-        else
-            update_desc "🟢 Running (pid ${_running})"
-        fi
+        update_state
         return 0
     fi
     sync_config || return 1
@@ -437,10 +507,16 @@ do_start() {
     if ! PISING_QUIET=1 "${bin_dir}/pi.iptables" on; then
         log Error "failed to install TPROXY rules, see ${module_log}"
         update_desc "🔴 Rules error"
+        drop_rules_if_dead
         return 1
     fi
-    update_desc "🟢 Running (pid ${_pid})"
-    selftest || return 1
+    update_state
+    if ! selftest; then
+        # The core can die while the probes run (a bad outbound kills it on the
+        # first packet). Keeping the rules then is what left the phone offline.
+        drop_rules_if_dead
+        return 1
+    fi
     return 0
 }
 
@@ -464,7 +540,7 @@ do_stop() {
     fi
     rm -f "$pid_file" "${run_dir}/core.gid"
     rm -f "$selftest_failed_file"
-    update_desc "🔴 Stopped"
+    update_state
     return 0
 }
 
@@ -542,15 +618,34 @@ core_arch() {
     esac
 }
 
+# settings.ini can put an accelerator in front of github.com (github is slow or
+# unreachable on some networks). Only github URLs are rewritten, and only the
+# URL: the tag and the sha256 still come from the release API, so a broken or
+# truncated download is still refused. A mirror that answers the API itself is
+# trusted for that answer, so configure one you trust.
+mirror_url() {  # $1 = url -> url to fetch (mirror-prefixed for github)
+    _m="${PISING_UPDATE_MIRROR:-${update_mirror:-}}"
+    case "${_m:-}" in
+        "") printf '%s' "$1"; return 0 ;;
+    esac
+    case "$1" in
+        https://github.com/*|https://api.github.com/*|https://raw.githubusercontent.com/*)
+            printf '%s/%s' "${_m%/}" "$1" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 # $3 = "keep" leaves an HTTP error body in $2: the GitHub API answers 403 with an
 # explanation worth reading, and the download is still checked by digest.
 fetch_url() {  # $1 = url, $2 = output file, $3 = keep (optional)
     _opt="-f"
     [ "${3:-}" = "keep" ] && _opt=""
+    _url="$(mirror_url "$1")"
+    [ "$_url" = "$1" ] || log Info "update: using mirror ${_url}"
     if command -v curl >/dev/null 2>&1; then
-        curl -sSL $_opt --retry 2 --connect-timeout 15 -m 300 -o "$2" "$1"
+        curl -sSL $_opt -A "pi-sing" --retry 2 --connect-timeout 15 -m 300 -o "$2" "$_url"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$2" "$1"
+        wget -q -O "$2" "$_url"
     else
         return 1
     fi
@@ -628,6 +723,8 @@ do_update_core() {
 
     log Info "update: ${_cur:-unknown} -> ${_ver}, downloading ${_tar}"
     if ! fetch_url "${UPDATE_DL}/${_tag}/${_tar}" "${_upd}/${_tar}"; then
+        # A partial file must not sit in run/update and be picked up as a core.
+        rm -f "${_upd}/${_tar}"
         log Error "update: download failed: ${UPDATE_DL}/${_tag}/${_tar}"
         return 1
     fi
@@ -711,7 +808,12 @@ do_watchdog() {
             if [ -x "$bin_path" ]; then
                 _nocore=0
                 log Warn "sing-box is gone, restarting"
-                do_start || sleep 30
+                if ! do_start; then
+                    # A restart that leaves no core drops the rules (see
+                    # drop_rules_if_dead) and waits longer before the next try.
+                    drop_rules_if_dead
+                    sleep 30
+                fi
             elif [ "$_nocore" = "0" ]; then
                 # A thin install can boot without a core. Retrying every interval
                 # would only repeat the same error, so say it once and wait.
@@ -723,11 +825,7 @@ do_watchdog() {
         elif [ "$_now" != "$_last" ]; then
             # Keeps the module card honest even when somebody starts or stops the
             # core outside this watchdog.
-            if [ -f "$selftest_failed_file" ]; then
-                update_desc "🟠 Tunnel down - tap to stop"
-            else
-                update_desc "🟢 Running (pid ${_now})"
-            fi
+            update_state
             _last="$_now"
             _nocore=0
         fi
