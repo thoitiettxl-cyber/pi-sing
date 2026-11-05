@@ -370,6 +370,19 @@ A useful device check set (all must hold):
     are answered by 1.1.1.1 over DoH directly — encrypted, just not through the
     tunnel. The shipped template has no `detour` on `remote_dns`, so it is not
     affected.
+  - **`dns.rules[].server` and `dns.final` are the same tax on a second path.**
+    After the default resolver was fixed, two rules (`geosite-telegram`,
+    `...googleapis.com`) and `dns.final` still pointed at the tunnel-side DoH, so
+    those names paid a tunnel round trip while their traffic went direct. Moving
+    all three to `direct_dns`: `www.googleapis.com` tls 0.76 s -> 0.185 s,
+    `telegram.org` answered with a real IP (149.154.167.99) instead of a fakeip,
+    `github.com` total 1.6-3.3 s -> 0.27-0.58 s, exit IP still direct
+    (115.77.59.104) and a `package_name` rule that is proxied still left through
+    the endpoint (uid 10492 -> 185.98.169.17). `remote_dns` ends up referenced by
+    nothing (`grep '"server": "remote_dns"'` = 0) and can stay defined for when a
+    name really should be resolved inside the tunnel. Never move the endpoint into
+    the `all` list of the direct selector on this phone — that separation is the
+    user's, by design.
 - **The release JSON is one line of compact JSON** (285 079 bytes measured) and
   toybox `sed`/`awk` give up on a line that long, so a layout-based parse finds
   nothing. `update-core` now joins the payload into one line and splits it at

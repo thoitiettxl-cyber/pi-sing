@@ -442,6 +442,16 @@ you write your own, keep the equivalent:
      (encrypted, just not through the tunnel): `domain_resolver` on a non-`direct`
      outbound/endpoint only covers its *server address*, not the destinations its
      tunnel carries.
+
+   The same split has to be carried into `dns.rules` and `dns.final` — a second,
+   separate path. A rule whose traffic is direct but whose `server` is the
+   tunnel-side resolver pays the same tunnel round trip for that name. Measured on
+   the same config after moving the two rules that serve direct traffic
+   (`geosite-telegram`, `...googleapis.com`) and `dns.final` to `direct_dns`:
+   `www.googleapis.com` tls 0.76 s -> 0.185 s, `telegram.org` answered with a real
+   IP (149.154.167.99) instead of a fakeip, `github.com` total 1.6-3.3 s ->
+   0.27-0.58 s, and a package rule that *is* proxied still left through the
+   endpoint. Keep `dns.final` off the fakeip server.
 4. Remote rule-sets are initialized **before** the endpoint is up, so the HTTP
    client they use needs a working resolver: the shipped config gives them
    `http_clients: [{"tag": "direct-http", "version": 2}]` plus
