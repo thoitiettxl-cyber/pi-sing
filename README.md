@@ -424,12 +424,24 @@ you write your own, keep the equivalent:
    `-D /data/adb/pi-sing/run`. The module leaves those values alone.
 2. One `{"type": "tproxy"}` inbound; its `listen_port` is owned by
    `settings.ini` (`pi-sing start` rewrites it).
-3. `route.default_domain_resolver` must be a **tunnel-side** DNS server, so every
-   name the phone dials is resolved inside the tunnel. A `type: local` server does
-   not work on Android (`read udp [::1]:53: connection refused`). The shipped
-   config resolves through `remote_dns` (DoH to 8.8.8.8) over the default
-   outbound; add `"detour": "Soul_🌐"` when everything should resolve inside the
-   tunnel.
+3. `route.default_domain_resolver` resolves the name of **every** dialed
+   destination, direct ones included, so it decides how slow a new connection is.
+   A `type: local` server does not work on Android (`read udp [::1]:53:
+   connection refused`). Two shapes, measured on the same WiFi (2026-11-05):
+
+   - *everything through the tunnel*: give `remote_dns` (DoH to 8.8.8.8)
+     `"detour": "Soul_🌐"` and point `default_domain_resolver` at it. Every name
+     costs one tunnel round trip before its dial.
+   - *mostly direct* (the common case): add a second server with **no** `detour`,
+     e.g. `{"type": "https", "tag": "direct_dns", "server": "1.1.1.1"}`, and set
+     `default_domain_resolver` to it. With the detour shape, `github.com` cost
+     tls 0.43-0.97 s / total 1.6-3.3 s while an IP literal to the same kind of
+     host cost 0.11-0.20 s; with `direct_dns` the same request became tls
+     0.11-0.14 s / total 0.28-0.36 s and the exit IP stayed direct. Names of
+     proxied destinations are then resolved by 1.1.1.1 over DoH directly
+     (encrypted, just not through the tunnel): `domain_resolver` on a non-`direct`
+     outbound/endpoint only covers its *server address*, not the destinations its
+     tunnel carries.
 4. Remote rule-sets are initialized **before** the endpoint is up, so the HTTP
    client they use needs a working resolver: the shipped config gives them
    `http_clients: [{"tag": "direct-http", "version": 2}]` plus
@@ -441,7 +453,11 @@ you write your own, keep the equivalent:
    host fails through the proxy, while the phone's own IPv6 works).
 
 A selector may be used as a DNS `detour`, a plain `direct` outbound may not
-(`detour to an empty direct outbound makes no sense`).
+(`detour to an empty direct outbound makes no sense`) — and neither may a selector
+whose only member is `direct`, which is the same thing one level up:
+`FATAL start service: start dns-transport: start dns/https[direct_dns]: detour to
+an empty direct outbound makes no sense`, at `run` only, `check` passes. A direct
+resolver is a server with no `detour` at all.
 
 ## Changing the config
 

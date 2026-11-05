@@ -345,6 +345,31 @@ A useful device check set (all must hold):
   `endpoint/wireguard[Proton-US_🔒]: outbound connection to 8.8.8.8:443`.
   `route.default_domain_resolver` is **not** this knob: it only sets the resolver
   outbounds use for the domains *they* dial (docs Dial Fields).
+- **A DNS `detour` is paid by every name that resolver answers, and the dial-time
+  destination lookup uses `route.default_domain_resolver` — so a "mostly direct"
+  config must not point it at a tunnel-side server.** Measured 2026-11-05 on the
+  user's own config (`remote_dns` = DoH 8.8.8.8 with `"detour": "Soul_🌐"`,
+  `default_domain_resolver` = `remote_dns`, everything else direct): `github.com`
+  tls 0.43-0.97 s / total 1.6-3.3 s, `api.github.com` tls 0.43-0.50 s, while the
+  same server family by IP literal cost tls 0.11-0.20 s — the name of a *direct*
+  connection was being resolved through the tunnel. Adding
+  `{"type": "https", "tag": "direct_dns", "server": "1.1.1.1"}` (no `detour`) and
+  pointing `default_domain_resolver` at it: tls 0.11-0.14 s, total 0.28-0.36 s,
+  exit IP unchanged (direct), a package that *is* proxied still left through the
+  endpoint (`api.ipify.org` → `185.98.169.17`), core clean (`FATAL 0`).
+  - `"detour": "Direct_🦈"` on that server is fatal at `run` only:
+    `FATAL start service: start dns-transport: start dns/https[direct_dns]: detour
+    to an empty direct outbound makes no sense` — a selector whose only member is
+    `direct` is empty, same rule as the bullet above but one level up. `check`
+    passes it; the module then fail-closes (rules dropped) so the phone stays
+    online and the card goes 🟠, which is how it was noticed.
+  - `domain_resolver` on a non-`direct` outbound/endpoint covers only its **server
+    address** (docs Dial Fields), never the destinations its tunnel carries, so it
+    cannot keep proxied names in-tunnel; `route.default_domain_resolver` decides
+    those. The trade-off after the switch is that names for proxied destinations
+    are answered by 1.1.1.1 over DoH directly — encrypted, just not through the
+    tunnel. The shipped template has no `detour` on `remote_dns`, so it is not
+    affected.
 - **The release JSON is one line of compact JSON** (285 079 bytes measured) and
   toybox `sed`/`awk` give up on a line that long, so a layout-based parse finds
   nothing. `update-core` now joins the payload into one line and splits it at
