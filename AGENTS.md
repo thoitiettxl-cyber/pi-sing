@@ -71,8 +71,9 @@ tools/fetch-sing-box.sh       pinned release + sha256
 tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip (module only,
                               the core is never bundled; --full is refused)
 tests/smoke-check.sh          sh -n on every script + sing-box check on both configs
-tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (27 assertions:
-                              TPROXY/DNS/per-app, hotspot ingress captured unless
+tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (30 assertions:
+                              TPROXY/DNS/per-app, an intranet destination stays
+                              out of the blanket MARK, hotspot ingress captured unless
                               it matches the uplink, PISING_DRY_RUN prints
                               without installing, ipv6=disable sets and restores
                               sysctls, an interface created after `on` inherits the
@@ -161,8 +162,8 @@ installer. Do not hardcode a ui/ directory anywhere.
 `PISING_BYPASS` (**ACCEPT**) → `-i lo` TPROXY → `ap.list.cfg` interfaces TPROXY.
 
 `PISING_LOCAL` in mangle `OUTPUT`: core gid RETURN → own_mark RETURN →
-`ignore_interfaces` RETURN → `PISING_SKIP` (**RETURN**) → DNS MARK → per-app →
-blanket MARK.
+`ignore_interfaces` RETURN → DNS MARK → intranet/local `RETURN` **inline in this
+chain** → per-app → blanket MARK.
 
 Why it must stay this way (each measured — see README):
 
@@ -170,6 +171,15 @@ Why it must stay this way (each measured — see README):
   loops the core's own answers (25k `inbound packet connection` lines for one
   request) or skips the vendor mangle chains behind us (`qcom_NWMGR`,
   `oplus_tos_mapping`, `connmark_*`).
+- The OUTPUT `RETURN`s must be written **into `PISING_LOCAL`**, not into a chain
+  it jumps to: a `RETURN` inside a user chain only resumes the caller, so the
+  intranet ranges fell through to the blanket MARK and every LAN connection from
+  the phone was proxied (measured 2026-11-05: TCP to a LAN printer,
+  `192.168.1.100:9100`, stayed `SYN_SENT`/`UNREPLIED` in conntrack while the
+  rules were up and connected the moment `pi-sing stop` ran; the PREROUTING
+  `ACCEPT` was never affected, which is why hotspot clients worked). An intranet
+  address whose check-box is a sub-chain is a bug even if the rules "look
+  right" — `tests/netns-tproxy-test.sh` now counts packets on the blanket MARK.
 - DNS rules before every bypass, or a private resolver escapes the hijack.
 - The core bypass must be by **gid** (`net_admin`, 3005) — `outbound.routing_mark`
   alone does not stop the DNS transport from being captured.
@@ -203,7 +213,7 @@ Host (this container; kernel has xt_TPROXY, `ip netns` works):
 
 ```
 SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
-SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 27/27 expected
+SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 30/30 expected
 tests/update-core-test.sh                           # 44/44 expected, no device
 tests/installer-test.sh                             # 67/67 expected, no device
 tests/cli-test.sh                                   # 38/38 expected, no device

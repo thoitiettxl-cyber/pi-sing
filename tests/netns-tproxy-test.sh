@@ -122,6 +122,29 @@ PY
 grep -q 'rcode=0' "${TMP}/dns.out" && ok "UDP/53 answered by sing-box ($(tr -d '\n' < "${TMP}/dns.out"))" ||
     { bad "UDP/53 hijack failed"; note "$(cat "${TMP}/dns.out")"; }
 
+echo "== intranet destinations stay direct (OUTPUT path)"
+# The RETURNs must sit in PISING_LOCAL itself: a RETURN inside a chain that
+# PISING_LOCAL jumps to only resumes in PISING_LOCAL, so the blanket MARK at the
+# end of it caught the intranet packet anyway (measured on the device
+# 2026-11-05: TCP to a LAN printer never left, conntrack SYN_SENT/UNREPLIED,
+# and it connected the moment `pi-sing stop` ran).
+ns iptables -t mangle -S PISING_LOCAL | grep -q -- '-d 10.0.0.0/8 -j RETURN' &&
+    ok "intranet RETURN rules live in PISING_LOCAL" ||
+    bad "intranet RETURN rules are missing from PISING_LOCAL"
+ns iptables -t mangle -S PISING_LOCAL | grep -q -- '-j PISING_SKIP' &&
+    bad "PISING_LOCAL jumps to a nested chain (its RETURN only resumes there)" ||
+    ok "no nested-chain jump left in PISING_LOCAL"
+mark_hits() {
+    ns iptables -t mangle -vnxL PISING_LOCAL 2>/dev/null |
+        awk '/MARK/ && /tcp/ && !/dpt:53/ { print $1 }' | tail -n 1
+}
+M1="$(mark_hits)"
+ns python3 -c "import socket; s = socket.socket(); s.settimeout(2); s.connect(('10.99.0.1', 9100))" 2>/dev/null
+sleep 1
+M2="$(mark_hits)"
+[ "${M1:-x}" = "${M2:-y}" ] && ok "a SYN to an intranet address was not marked (${M1})" ||
+    bad "a SYN to an intranet address was marked (${M1} -> ${M2})"
+
 echo "== per-app blacklist"
 if command -v setpriv >/dev/null 2>&1; then
     printf '12345\n' >> "$DATA/lists/package.list.cfg"

@@ -333,10 +333,17 @@ never `ACCEPT`):
 1. `-m owner --gid-owner <core_gid>` → `RETURN` (the core itself; without this DNS loops forever)
 2. `-m mark --mark <own_mark>` → `RETURN` (second guard)
 3. `-o <ignore_interfaces>` → `RETURN`
-4. `-j PISING_SKIP` (private ranges → `RETURN`)
-5. `tcp/udp --dport 53` → `MARK` (DNS hijacked for every app in both modes)
+4. `tcp/udp --dport 53` → `MARK` (DNS hijacked for every app in both modes, before the intranet `RETURN` so a private resolver cannot leak)
+5. `-d <intranet4/intranet6 + local addresses>` → `RETURN` **written into this chain**, never into a nested one
 6. per-app: blacklist → listed uids `RETURN`, then everything marked; whitelist → only listed uids marked
 7. `tcp`/`udp` → `MARK`
+
+Step 5 used to be `-j PISING_SKIP` with the `RETURN`s inside that chain. A
+`RETURN` in a user chain only resumes the caller, so every intranet packet fell
+through to step 7 and was marked: the phone's own TCP to a LAN printer
+(`192.168.1.100:9100`) sat in `SYN_SENT/UNREPLIED` while the rules were up and
+connected the moment `pi-sing stop` ran (2026-11-05). The `ACCEPT` in
+`PISING_BYPASS` was never affected — `ACCEPT` ends the table traversal.
 
 `PISING_DIVERT` (PREROUTING, `-m socket --transparent`) marks and accepts packets
 of an already handled connection. `PISING_GUARD` (filter OUTPUT) rejects direct
