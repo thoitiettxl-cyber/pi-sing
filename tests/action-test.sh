@@ -87,13 +87,21 @@ esac
 exit 0
 EOF
 # Probe 1 is the direct one (must work), probe 2 the proxied one (the tunnel).
-# FAIL_PROXIED=1 -> probe 2 fails; 0 -> both pass.
 cat > "${FAKE}/curl" <<EOF
 #!/bin/sh
-# Calls come in pairs per start: 1 = direct probe, 2 = proxied probe.
+# A start probes three times: https://1.1.1.1 twice (1 = direct, 2 = proxied)
+# and https://www.gstatic.com once (the name probe). Only the 1.1.1.1 calls are
+# counted, so the name probe cannot shift the parity the way it did when the
+# DNS probe was added (measured 2026-11-05: 18 assertions went red).
+case " \$* " in
+    *gstatic.com*)
+        [ "\${FAIL_DNS:-0}" = "1" ] && exit 7
+        exit 0 ;;
+esac
 _n=\$(cat "${TMP}/curl.n" 2>/dev/null || echo 0)
 _n=\$((_n + 1))
 echo "\$_n" > "${TMP}/curl.n"
+# FAIL_PROXIED=1 -> the proxied call fails; 0 -> both pass.
 [ "\${FAIL_PROXIED:-1}" = "1" ] && [ \$((_n % 2)) -eq 0 ] && exit 7
 exit 0
 EOF

@@ -456,6 +456,48 @@ start_core() {
 
 # ----------------------------------------------------------------- actions
 
+# The watchdog loop is the only thing that re-applies `ipv6=disable` and restarts
+# a crashed core, and only service.sh ever started it: a `pi-sing restart`, the
+# action button or `update-core` left the phone without that loop until the next
+# boot. Measured 2026-11-05: the loop was gone from 00:05 (no `watchdog started`
+# after 23:37, no process), wlan0 had `disable_ipv6=0` at 00:12, and the
+# wifi -> 4G leak test in between answered from the carrier's resolvers.
+# `run/watchdog.pid` is written by the loop itself. The pid alone is not trusted
+# (a recycled pid would hide a dead loop), and `pgrep -f "pi-sing watchdog"` is
+# not usable either (toybox matches either word, measured): the command line has
+# to be read.
+# The interpreter this script runs under. The file's shebang is /system/bin/sh
+# (Android's mksh), so executing the file itself is only valid on the device; a
+# host or test-tree copy has no such path and would die before its first line.
+self_sh() {
+    command -v sh 2>/dev/null || printf '/system/bin/sh'
+}
+
+watchdog_alive() {
+    [ -f "${run_dir}/watchdog.pid" ] || return 1
+    _wpid="$(cat "${run_dir}/watchdog.pid" 2>/dev/null)"
+    [ -n "${_wpid:-}" ] || return 1
+    kill -0 "$_wpid" 2>/dev/null || return 1
+    case "$(tr '\0' ' ' < "/proc/${_wpid}/cmdline" 2>/dev/null)" in
+        *"pi-sing watchdog"*) return 0 ;;
+    esac
+    return 1
+}
+
+ensure_watchdog() {
+    [ "${watchdog:-0}" = "1" ] || return 0
+    watchdog_alive && return 0
+    log Info "watchdog is not running, starting it"
+    _pre=""
+    command -v nohup >/dev/null 2>&1 && _pre="nohup "
+    command -v setsid >/dev/null 2>&1 && _pre="${_pre}setsid "
+    # Through `sh`, not by executing the file: $0 is a module path whose shebang
+    # is /system/bin/sh, and a copy on a host or in a test tree would fail to exec.
+    # shellcheck disable=SC2086
+    $_pre "$(self_sh)" "$0" watchdog >/dev/null 2>&1 &
+    return 0
+}
+
 do_start() {
     rm -f "$state_file"
     if [ ! -x "$bin_path" ]; then
@@ -468,6 +510,7 @@ do_start() {
         printf '%s\n' "$_running" > "$pid_file"
         log Info "already running (pid ${_running})"
         update_state
+        ensure_watchdog
         return 0
     fi
     # A fresh attempt gets a fresh verdict; the already-running branch above keeps
@@ -504,6 +547,9 @@ do_start() {
         return 1
     fi
     update_state
+    # Started once the core and the rules exist: a loop that woke while `start`
+    # was still running would see no core and start a second one.
+    ensure_watchdog
     if ! selftest; then
         # The core can die while the probes run (a bad outbound kills it on the
         # first packet). Keeping the rules then is what left the phone offline.
@@ -810,11 +856,13 @@ v6_drift() {
 do_watchdog() {
     [ "$watchdog" = "1" ] || { log Info "watchdog disabled"; return 0; }
     log Info "watchdog started (${watchdog_interval}s)"
-    # The boot service is the only place that starts this loop, so a module
-    # update (a new script, an update-core, a reinstall) would leave the old code
-    # running until the next reboot. Measured 2026-11-04: the IPv6 re-apply only
-    # reached the phone after the loop was restarted by hand. `cksum` once per
-    # interval is cheap, and `exec` keeps the same pid.
+    # `ensure_watchdog` trusts this pid only together with the command line, so
+    # it has to be this process': `exec` below keeps the same pid.
+    printf '%s\n' "$$" > "${run_dir}/watchdog.pid" 2>/dev/null
+    # A module update (a new script, an update-core, a reinstall) would leave the
+    # old code running until the next reboot. Measured 2026-11-04: the IPv6
+    # re-apply only reached the phone after the loop was restarted by hand.
+    # `cksum` once per interval is cheap, and `exec` keeps the same pid.
     _own=""
     command -v cksum >/dev/null 2>&1 && _own="$(cksum "$0" 2>/dev/null)"
     _iface=""
@@ -841,7 +889,7 @@ do_watchdog() {
             _now="$(cksum "$0" 2>/dev/null)"
             if [ -n "$_now" ] && [ "$_now" != "$_own" ]; then
                 log Info "pi-sing changed on disk, re-exec so the loop runs the new code"
-                exec "$0" watchdog
+                exec "$(self_sh)" "$0" watchdog
             fi
         fi
         # Cheap: a few file reads, and a log line only when something drifted.

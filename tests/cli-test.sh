@@ -212,6 +212,34 @@ kill -9 "$WPID" 2>/dev/null
 for _p in $(pgrep -f "$DATA/bin/pi-sing watchdog" 2>/dev/null); do kill -9 "$_p" 2>/dev/null; done
 sed -i 's/^watchdog_interval=.*/watchdog_interval=30/' "$DATA/settings.ini"
 
+echo "== a start brings the watchdog back, and only one"
+# Measured on the device 2026-11-05: the loop only ever started from service.sh,
+# so a `pi-sing restart` left the phone without it (no v6enforce, no restart of a
+# crashed core) until the next boot, and the wifi -> 4G leak test answered from
+# the carrier's resolvers. `watchdog_alive` reads the loop's own pid AND its
+# command line, because a recycled pid must not hide a dead loop.
+wd_count() {
+    _n=0
+    for _p in /proc/[0-9]*; do
+        tr '\0' ' ' < "$_p/cmdline" 2>/dev/null | grep -qF "$DATA/bin/pi-sing watchdog" && _n=$((_n + 1))
+    done
+    printf '%s' "$_n"
+}
+reset
+sed -i 's/^watchdog=.*/watchdog=1/' "$DATA/settings.ini"
+sed -i 's/^watchdog_interval=.*/watchdog_interval=1/' "$DATA/settings.ini"
+cli start >/dev/null 2>&1
+sleep 1
+eq "$(wd_count)" "1" "a start starts the missing watchdog loop"
+[ -f "$DATA/run/watchdog.pid" ] && ok "the loop records its pid" || bad "no run/watchdog.pid"
+cli start >/dev/null 2>&1
+sleep 1
+eq "$(wd_count)" "1" "a second start does not start a second loop"
+cli stop >/dev/null 2>&1
+kill -9 "$(cat "$DATA/run/watchdog.pid" 2>/dev/null)" 2>/dev/null
+sed -i 's/^watchdog=.*/watchdog=0/' "$DATA/settings.ini"
+sed -i 's/^watchdog_interval=.*/watchdog_interval=30/' "$DATA/settings.ini"
+
 echo "== a process that only mentions the core path is not the core"
 echo "== a name lookup that fails while 1.1.1.1 works turns the card orange"
 # Measured on the device: sing-box's DoH server had a detour through the tunnel,

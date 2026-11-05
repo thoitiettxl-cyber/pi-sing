@@ -81,10 +81,11 @@ tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (27 assertions:
 tests/cli-test.sh             host, stub core: dashboard resolution (relative /
                               object / absolute), core_log_level, 🟢/🔴 description,
                               log split/rotation, watchdog vs a user stop, a decoy
-                              process that mentions bin_path is not the core,
+                              process that mentions bin_path is not the core, a start
+                              that brings a killed watchdog back exactly once,
                               services[].dashboard left alone, a failing name lookup
                               flagging run/dns.failed and the 🟠 DNS card while the
-                              rules stay (35)
+                              rules stay (38)
 tests/action-test.sh          host: fail-closed state (rules stay, core dies) and
                               the action button's one-press OFF, the 🟠 card, the
                               watchdog not repainting 🟢 over it, a stale verdict not
@@ -205,7 +206,7 @@ SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-che
 SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 27/27 expected
 tests/update-core-test.sh                           # 44/44 expected, no device
 tests/installer-test.sh                             # 67/67 expected, no device
-tests/cli-test.sh                                   # 35/35 expected, no device
+tests/cli-test.sh                                   # 38/38 expected, no device
 tests/action-test.sh                                # 32/32 expected, no device
 tools/build.sh                                      # smoke + the module zip (no core)
 ```
@@ -391,14 +392,28 @@ A useful device check set (all must hold):
   resolver either way, and `0` conntrack entries existed for the ISP resolvers the
   failing test had named. Keep the user's `detour`; only the detection above is
   this module's business.
-- **The watchdog is started by `service.sh` only, so it re-execs itself when the
-  script changes.** Measured 2026-11-04: a new `pi-sing` was pushed to
+- **The watchdog re-execs itself when the script changes, and `start` has to
+  bring it back.** Measured 2026-11-04: a new `pi-sing` was pushed to
   `/data/adb/pi-sing/bin` and `pi-sing restart` did not touch the loop that had
   been running since boot, so the new per-tick work never happened until the loop
   was restarted by hand. `do_watchdog` compares `cksum "$0"` once per interval
   and `exec`s itself on a change (same pid). Killing a stale loop by hand needs
   the pid plus `/proc/<pid>/cmdline`, never `pgrep -f "pi-sing watchdog"` (toybox
   matches either word and lists `sing-box`).
+  Only `service.sh` used to start the loop, so a `restart`, the action button or
+  `update-core` left the phone without it until the next boot — measured
+  2026-11-05: the loop was gone from 00:05 (nothing logged after 23:37, no such
+  process), `wlan0/disable_ipv6` was back to 0 at 00:12, and the wifi -> 4G leak
+  test in between answered from the carrier's resolvers. `do_start` now calls
+  `ensure_watchdog`, which trusts `run/watchdog.pid` only together with
+  `/proc/<pid>/cmdline` (a recycled pid must not hide a dead loop) and spawns
+  `nohup setsid sh $0 watchdog` when `watchdog=1`. Through `sh`, not by executing
+  the file: its shebang is `/system/bin/sh`, which does not exist on a host test
+  copy — that copy died before its first line, silently, and the new cli-test case
+  caught it. Measured on the device: kill the loop, `pi-sing start` logs
+  `watchdog is not running, starting it`, the new loop writes `run/watchdog.pid`,
+  a second `start` keeps exactly one loop, and its probe fixed a forced
+  `disable_ipv6=0` in 0.4 s.
 - **An old `settings.ini` has no `core_log_level`**: resolve the default in a
   variable (`_lvl="${core_log_level:-warn}"`) before using it under `set -u`, or
   awk never runs and the config keeps `info` (measured on the first device
