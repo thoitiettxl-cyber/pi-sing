@@ -7,7 +7,7 @@ finding, not a flake.
 
 ```
 SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
-SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 30/30 expected
+SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 37/37 expected
 tests/update-core-test.sh                           # 44/44 expected, no device
 tests/installer-test.sh                             # 67/67 expected, no device
 tests/cli-test.sh                                   # 38/38 expected, no device

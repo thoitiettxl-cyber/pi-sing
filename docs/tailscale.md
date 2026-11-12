@@ -154,3 +154,49 @@ member is this phone itself.
 - <https://sing-box.sagernet.org/configuration/dns/rule/> (`preferred_by`, 1.14.0)
 - <https://sing-box.sagernet.org/configuration/route/rule/> (`preferred_by`, 1.13.0)
 - <https://sing-box.sagernet.org/configuration/outbound/tailcat/> (not this)
+
+## The peer range must be captured by the proxy (measured 2026-11-12)
+
+The endpoint's traffic is the endpoint's own WireGuard session, but *apps* talking
+to a peer use ordinary TCP to a `100.64.0.0/10` address, and sing-box has to route
+that address into the endpoint (`preferred_by`). On this module that needs one
+setting beyond the config:
+
+```
+tailnet4="100.64.0.0/10"        # settings.ini
+```
+
+Without it the range sits on both bypass lists (`PISING_LOCAL` RETURN,
+`PISING_BYPASS` ACCEPT), the packet is never marked, `ip rule fwmark` never sends
+it to lo, and the kernel picks the uplink route for a tailnet address:
+
+```
+# ip route get 100.122.36.114     (phone, rules up, tailnet4 empty)
+100.122.36.114 via 10.94.171.81 dev rmnet_data3 table rmnet_data3 src 10.94.171.80
+```
+
+Measured result of that state: every peer timed out from the phone and from the
+container, while `tailscale status` on the peer side still showed a fresh
+`LastHandshake` and non-zero `RxBytes` for `pi-sing`. Do not read those counters as
+"the phone reached the peer": they belong to the endpoint's UDP session to DERP,
+which is a different path from the app's TCP.
+
+The check that tells the two apart, from the phone:
+
+```
+nc -w5 <peer tailnet ip> 22 </dev/null      # banner = captured, timeout = bypassed
+```
+
+A/B, one rule at a time (2026-11-12, peer `100.71.219.56` running sshd):
+
+| rules | result |
+| --- | --- |
+| shipped | timeout |
+| `MARK` in `PISING_LOCAL` only | timeout |
+| `TPROXY` in `PISING_EXT` only | timeout |
+| both | `SSH-2.0-OpenSSH_10.0p2 Debian-7+deb13u4` |
+
+Both halves are required: without the `MARK` the packet never reaches lo, and
+without the `TPROXY` the answer never re-enters the tunnel. Leave `tailnet4`
+empty when no endpoint is configured — a captured range with no endpoint behind
+it has no route and times out.

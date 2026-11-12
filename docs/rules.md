@@ -3,6 +3,11 @@
 `PISING_EXT` in mangle `PREROUTING`: bypass interfaces → DNS (53 tcp/udp) TPROXY →
 `PISING_BYPASS` (**ACCEPT**) → `-i lo` TPROXY → `ap.list.cfg` interfaces TPROXY.
 
+`PISING_BYPASS` and the intranet `RETURN` below both carry the same list:
+`intranet4` minus `tailnet4` (settings.ini). A range listed in `tailnet4` is
+captured like a public destination instead of bypassed — see "A tunnel range"
+at the end of this file.
+
 `PISING_LOCAL` in mangle `OUTPUT`: core gid RETURN → own_mark RETURN →
 `ignore_interfaces` RETURN → DNS MARK → intranet/local `RETURN` **inline in this
 chain** → per-app → blanket MARK.
@@ -48,3 +53,31 @@ Why it must stay this way (each measured — see README):
   ingress proxies traffic that merely passes through (and the dev container's own
   path). `PISING_UPLINK_IF=<iface>` overrides the detection for tests or a ROM
   where `ip route get` answers from the wrong table.
+
+## A tunnel range must leave both bypass lists (measured 2026-11-12)
+
+`100.64.0.0/10` is on `intranet4` because it is shared address space, and that is
+right for a LAN. It is wrong for a tailnet: the sing-box `tailscale` endpoint
+carries `100.64.0.0/10` peers, and both bypass rules together made every peer
+unreachable from the phone *and* from the container.
+
+| state | phone → peer (ssh banner) |
+| --- | --- |
+| as shipped (RETURN in `PISING_LOCAL` + ACCEPT in `PISING_BYPASS`) | timeout |
+| OUTPUT `RETURN` removed only | timeout |
+| PREROUTING `ACCEPT` removed only | timeout |
+| both removed | `SSH-2.0-OpenSSH_10.0p2 Debian-7+deb13u4` |
+
+Why either half alone is not enough: `RETURN` in `OUTPUT` leaves the packet
+unmarked, so `ip rule fwmark` never sends it to lo and the kernel picks the
+uplink route (`ip route get 100.64.0.1` → `via 10.94.171.81 dev rmnet_data3`);
+`ACCEPT` in `PREROUTING` then keeps the peer's answer from re-entering the
+tunnel. At the same time the peer's own control-plane view looked healthy — its
+`LastHandshake` and `RxBytes` moved — which is what made it look like a client
+bug. That handshake belongs to the *endpoint inside sing-box* (a WireGuard
+session over UDP to DERP), not to the phone's own TCP.
+
+The fix is a knob, not a hard-coded edit: `tailnet4` in `settings.ini` lists the
+ranges to capture, the other intranet ranges keep their `RETURN`/`ACCEPT`.
+Empty by default, so a phone without a tunnel endpoint keeps the LAN
+`RETURN`s exactly as before.

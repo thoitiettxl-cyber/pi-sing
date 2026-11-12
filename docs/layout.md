@@ -27,9 +27,10 @@ tools/fetch-sing-box.sh       pinned release + sha256
 tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip (module only,
                               the core is never bundled; --full is refused)
 tests/smoke-check.sh          sh -n on every script + sing-box check on both configs
-tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (30 assertions:
+tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (37 assertions:
                               TPROXY/DNS/per-app, an intranet destination stays
-                              out of the blanket MARK, hotspot ingress captured unless
+                              out of the blanket MARK, a `tailnet4` range is
+                              captured instead of bypassed, hotspot ingress captured unless
                               it matches the uplink, PISING_DRY_RUN prints
                               without installing, ipv6=disable sets and restores
                               sysctls, an interface created after `on` inherits the

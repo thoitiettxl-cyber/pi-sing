@@ -145,6 +145,39 @@ M2="$(mark_hits)"
 [ "${M1:-x}" = "${M2:-y}" ] && ok "a SYN to an intranet address was not marked (${M1})" ||
     bad "a SYN to an intranet address was marked (${M1} -> ${M2})"
 
+echo "== a tailnet range is captured, not bypassed (tailnet4)"
+# Measured on the device 2026-11-12: with 100.64.0.0/10 on both bypass lists a
+# tailnet peer was unreachable from the phone and from the container while the
+# peer's own handshake counters moved. Both halves have to move: the OUTPUT
+# RETURN sent the packet out of the uplink, and the PREROUTING ACCEPT kept the
+# answer from re-entering the tunnel.
+ns iptables -t mangle -S PISING_LOCAL | grep -q -- '-d 100.64.0.0/10 -j RETURN' &&
+    ok "100.64.0.0/10 is bypassed by default" || bad "the default bypass list changed"
+printf '\ntailnet4="100.64.0.0/10"\n' >> "$DATA/settings.ini"
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+for _chk in PISING_LOCAL:RETURN PISING_BYPASS:ACCEPT; do
+    _chain="${_chk%%:*}"; _verdict="${_chk##*:}"
+    ns iptables -t mangle -S "$_chain" | grep -q -- "-d 100.64.0.0/10 -j ${_verdict}" &&
+        bad "100.64.0.0/10 is still bypassed in ${_chain}" ||
+        ok "100.64.0.0/10 left the bypass list of ${_chain}"
+done
+ns iptables -t mangle -S PISING_LOCAL | grep -q -- '-d 10.0.0.0/8 -j RETURN' &&
+    ok "the other private ranges are still bypassed" || bad "tailnet4 removed more than its own range"
+# Captured means the blanket MARK sees it: nothing RETURNs for it any more.
+_tail_m1="$(ns iptables -t mangle -vnxL PISING_LOCAL 2>/dev/null | awk '/MARK/ && /tcp/ && !/dpt:53/ { print $1 }' | tail -n 1)"
+ns python3 -c "import socket; s = socket.socket(); s.settimeout(2); s.connect(('100.64.0.1', 9100))" 2>/dev/null
+sleep 1
+_tail_m2="$(ns iptables -t mangle -vnxL PISING_LOCAL 2>/dev/null | awk '/MARK/ && /tcp/ && !/dpt:53/ { print $1 }' | tail -n 1)"
+[ "${_tail_m1:-x}" != "${_tail_m2:-y}" ] &&
+    ok "a SYN to the tailnet range was marked for the proxy (${_tail_m1} -> ${_tail_m2})" ||
+    bad "a SYN to the tailnet range was not marked (${_tail_m1} -> ${_tail_m2})"
+sed -i '/^tailnet4=/d' "$DATA/settings.ini"
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+ns iptables -t mangle -S PISING_LOCAL | grep -q -- '-d 100.64.0.0/10 -j RETURN' &&
+    ok "clearing tailnet4 puts the range back on the bypass list" || bad "tailnet4 stayed applied after removal"
+[ "${M1:-x}" = "${M2:-y}" ] && ok "a SYN to an intranet address was not marked (${M1})" ||
+    bad "a SYN to an intranet address was marked (${M1} -> ${M2})"
+
 echo "== per-app blacklist"
 if command -v setpriv >/dev/null 2>&1; then
     printf '12345\n' >> "$DATA/lists/package.list.cfg"

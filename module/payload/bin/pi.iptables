@@ -102,6 +102,24 @@ c_v6="PISING_V6BLOCK"   # filter OUTPUT/FORWARD, reject IPv6 in ipv6=block
 intranet4="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 255.255.255.255/32"
 intranet6="::/128 ::1/128 ::ffff:0:0/96 100::/64 64:ff9b::/96 2001:db8::/32 fe80::/10 ff00::/8"
 
+# Ranges that belong to a tunnel endpoint rather than to the local network: they
+# are captured like any public destination instead of being bypassed, so the
+# endpoint's route rule (`preferred_by`) can reach them. Measured 2026-11-12:
+# with 100.64.0.0/10 on both bypass lists, no tailnet peer was reachable from the
+# phone or from the container, while the peer's own handshake counters moved (the
+# kernel sent the packets out of the uplink, where nothing answers). Capturing
+# the range made an SSH banner from a peer arrive, and it needed both halves:
+# MARK in PISING_LOCAL only = timeout, TPROXY ahead of PISING_BYPASS only =
+# timeout, both = banner. `tailnet4` is a settings.ini knob; empty keeps every
+# range on the bypass lists.
+intranet4_bypass=""
+for _cidr in $intranet4; do
+    case " ${tailnet4:-} " in
+        *" $_cidr "*) continue ;;
+    esac
+    intranet4_bypass="${intranet4_bypass} ${_cidr}"
+done
+
 packages_list_file="/data/system/packages.list"
 
 # ------------------------------------------------------------------ helpers
@@ -287,7 +305,7 @@ build_local() {
     if [ "$_fam" = 6 ]; then
         build_skip "$_ipt" "$c_local" "$intranet6 $(local_addrs 6)" RETURN
     else
-        build_skip "$_ipt" "$c_local" "$intranet4 $(local_addrs 4)" RETURN
+        build_skip "$_ipt" "$c_local" "$intranet4_bypass $(local_addrs 4)" RETURN
     fi
     # 6. per-app selection.
     _uids=""
@@ -344,7 +362,7 @@ apply_proto() {
     if [ "$_fam" = 6 ]; then
         build_skip "$_ipt" "$c_bypass" "$intranet6 $(local_addrs 6)" ACCEPT
     else
-        build_skip "$_ipt" "$c_bypass" "$intranet4 $(local_addrs 4)" ACCEPT
+        build_skip "$_ipt" "$c_bypass" "$intranet4_bypass $(local_addrs 4)" ACCEPT
     fi
     build_ext "$_ipt" "${3:-no}"
     build_local "$_ipt" "${3:-no}" "$_fam"
