@@ -1,9 +1,17 @@
 # Tailscale endpoint, DNS and route rules
 
 Added 2026-11-12 to the user's live config, on sing-box **1.14.4** (the version
-the module ships). The android arm64 build from upstream is tagged
-`with_tailscale`, so no custom build is needed: the doc pages linked below
-describe a feature this binary already has.
+the module ships). The upstream android arm64 build is compiled with
+`with_tailscale`, so no custom build is needed. Re-check on a new core before
+trusting that:
+
+```
+grep -ao with_tailscale /data/adb/pi-sing/bin/sing-box | sort -u   # printed twice
+```
+
+Measured on the phone 2026-11-12: `/data/adb/pi-sing/bin/sing-box` (82 765 688 B,
+2026-10-23) prints `with_tailscale`; a build without it would parse the endpoint
+type as unknown instead.
 
 Three separate things share the word "tailscale"; keep them apart:
 
@@ -98,7 +106,7 @@ protocol/tailscale/endpoint.go: Waiting for authentication: <url>   (Info level)
 ```
 
 The live config runs `log.level = "warn"` and `core_log_level=warn`, so that line
-is **invisible** in `run/log/sing-box.log`. `scripts/services[].dashboard`
+is **invisible** in `run/log/sing-box.log`. `services[].dashboard`
 (`/data/adb/pi-sing/config/ui`) is the way in: Tools → Endpoints. The state file
 is the proof of login without any UI:
 

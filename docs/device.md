@@ -90,6 +90,11 @@ cmd wifi status | grep -oE 'Frequency: [0-9]+MHz|Link speed: [0-9]+Mbps'
 
 ## The user's live config — report, do not "fix"
 
+The live file is `/data/adb/pi-sing/config/config.json` (0600). A JSON the user
+hands over from `/storage/emulated/0/Download/config.json` is a **staging copy**:
+edit and `check` it there, then it is imported. Compare the two after an import —
+`ls -la` both and diff the sizes before assuming which one the core runs.
+
 Read from `/data/adb/pi-sing` on 2026-11-05:
 
 - `proxy_mode=blacklist`, `package.list.cfg` has **no** entries, `quic=disable`,
