@@ -61,6 +61,7 @@ These are not style preferences; each one prevents a concrete failure.
 | `docs/testing.md` | before running tests, and before touching rules on the live phone |
 | `docs/android-traps.md` | pids and the watchdog, `sing-box` DNS/`detour`, netd/IPv6, `update-core`, `check` vs `run` |
 | `docs/device.md` | you need this phone's own numbers: hardware/ROM, the two SIMs and RAT, the WiFi 80→160 MHz country-code finding, the user's live config |
+| `docs/tailscale.md` | you touch the `tailscale` endpoint, `ts_dns`, `preferred_by`, MagicDNS, or need the login/state facts |
 | `docs/release.md` | you bump the version or build/publish the zip |
 
 ## Working on the device, in one breath

@@ -105,6 +105,13 @@ Read from `/data/adb/pi-sing` on 2026-11-05:
   `route.default_domain_resolver`.
 - **Never move the endpoint into the `all` list of the direct selector.** That
   separation is the user's, by design.
+- **A Tailscale endpoint + MagicDNS were added on 2026-11-12** and are part of
+  that same "report, do not fix" set: `endpoints[]` tag `Tailscale_🦎`
+  (`state_directory=/data/adb/pi-sing/config/tailscale`, `hostname=pi-sing`),
+  DNS server `ts_dns`, and two `preferred_by` rules. Verified on the phone the
+  same day: state logged in (`LoginName` redacted in this repo), tailnet
+  `tailb5648f.ts.net`, self IP `100.119.98.112`, `ping pi-sing` resolves. Shape,
+  ordering, and the `check`-passes-`run`-fails traps: `docs/tailscale.md`.
 - Switching WiFi off/on (uplink `wlan0` ↔ `rmnet_data2`) produces a ~5 s burst of
   `lookup ... dial tcp 1.1.1.1:443: i/o timeout` in `sing-box.log`; it heals by
   itself (measured 12:52:53, fine at 12:55:57). Not a module bug.
