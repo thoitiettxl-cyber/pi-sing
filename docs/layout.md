@@ -27,7 +27,7 @@ tools/fetch-sing-box.sh       pinned release + sha256
 tools/build.sh                smoke check + dist/Pi-Sing-<version>.zip (module only,
                               the core is never bundled; --full is refused)
 tests/smoke-check.sh          sh -n on every script + sing-box check on both configs
-tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (37 assertions:
+tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (55 assertions:
                               TPROXY/DNS/per-app, an intranet destination stays
                               out of the blanket MARK, a `tailnet4` range is
                               captured instead of bypassed, hotspot ingress captured unless
@@ -35,7 +35,11 @@ tests/netns-tproxy-test.sh    end-to-end in a throw-away netns (37 assertions:
                               without installing, ipv6=disable sets and restores
                               sysctls, an interface created after `on` inherits the
                               `default` template, `v6enforce` undoes what netd
-                              turns back on)
+                              turns back on, a `renew` that never leaves the table
+                              without its hooks nor switches IPv6 back on in
+                              ipv6=disable, the rule-by-rule fallback when a table
+                              refuses its batch, the tproxy port answering
+                              TPROXY'd traffic only)
 tests/cli-test.sh             host, stub core: dashboard resolution (relative /
                               object / absolute), core_log_level, 🟢/🔴 description,
                               log split/rotation, watchdog vs a user stop, a decoy
@@ -43,7 +47,11 @@ tests/cli-test.sh             host, stub core: dashboard resolution (relative /
                               that brings a killed watchdog back exactly once,
                               services[].dashboard left alone, a failing name lookup
                               flagging run/dns.failed and the 🟠 DNS card while the
-                              rules stay (38)
+                              rules stay, one watchdog loop (the real service.sh,
+                              a second `watchdog`, two started together), a stale
+                              run/pi-sing.pid and a foreign sing-box not passing
+                              for the core, a control API without a secret
+                              reported (56)
 tests/action-test.sh          host: fail-closed state (rules stay, core dies) and
                               the action button's one-press OFF, the 🟠 card, the
                               watchdog not repainting 🟢 over it, a stale verdict not
@@ -57,11 +65,13 @@ tests/installer-test.sh       customize.sh on the host: fresh install, system/bi
                               getevent (wall-clock window, drained queue), thin zip
                               with/without a core (67)
 tests/update-core-test.sh     update-core against a fake release API served locally:
-                              digest, a compact one-line payload (what GitHub
+                              digest in GitHub's asset shape (a nested `uploader`
+                              between name and digest) and in a flat one, a
+                              compact one-line payload (what GitHub
                               serves), a release with no digest at all, swap +
                               restart, no-op, refusal, rollback, first
                               core on a thin install (no previous binary to back up),
-                              update_mirror rewriting only github URLs (38)
+                              update_mirror rewriting only github URLs (47)
 ```
 
 ## On the device

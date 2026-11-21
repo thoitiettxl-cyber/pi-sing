@@ -34,12 +34,17 @@ Host-side tests, run on the same kernel:
 
 ```
 tests/smoke-check.sh                  every script parses (dash), both configs pass `sing-box check` 1.14.4
-tests/netns-tproxy-test.sh            14/14 — TCP, UDP/53 hijack, per-app blacklist + whitelist,
-                                      core-gid bypass (no capture loop), clean teardown
-tests/cli-test.sh                     30/30 — services[].dashboard is left untouched,
+tests/netns-tproxy-test.sh            55/55 — TCP, UDP/53 hijack, per-app blacklist + whitelist,
+                                      core-gid bypass (no capture loop), a renew that never
+                                      leaves the table without its hooks, the tproxy port
+                                      answering TPROXY'd traffic only, clean teardown
+tests/cli-test.sh                     56/56 — services[].dashboard is left untouched,
                                       core_log_level, 🟢/🔴 description, log split, log rotation,
                                       watchdog leaves a user-stopped core stopped, a process
-                                      that only mentions the core path is not the core
+                                      that only mentions the core path is not the core, nor is
+                                      a stale pid file or another sing-box, one watchdog loop
+                                      through the real service.sh, an API without a secret
+                                      reported
 tests/action-test.sh                  32/32 — fail-closed state (rules stay, core dies), the
                                       action button's one-press OFF, the 🟠 card, the watchdog
                                       not repainting 🟢, a stale verdict not carried into the
@@ -51,8 +56,9 @@ tests/installer-test.sh               67/67 — fresh install, system/bin symlin
                                       stale watchdog killed, volume-key prompt (+) / (-) on a
                                       wall-clock window, thin zip with no core, failed download,
                                       old settings.ini rejected
-tests/update-core-test.sh             44/44 — update-core against a fake release API: digest
-                                      verified, swap + restart, "already latest" no-op,
+tests/update-core-test.sh             47/47 — update-core against a fake release API in
+                                      GitHub's shape: digest verified, swap + restart,
+                                      "already latest" no-op,
                                       bad digest / failing `check` / dead core refused,
                                       previous binary restored and restarted, first core
                                       on a thin install (no previous binary), update_mirror
@@ -262,12 +268,16 @@ have to be rebuilt or reinstalled.
   and the asset name follows `ro.product.cpu.abi` (`arm64-v8a` -> `android-arm64`,
   `armeabi-v7a` -> `android-arm`, `x86_64` -> `amd64`, `x86` -> `386`);
 - the archive is checked against the `sha256` digest GitHub publishes for that
-  asset when the API carries one, so a broken download or a proxy that rewrites
-  the body is rejected. sing-box's tarballs currently have **no** `digest` in the
-  response (measured on v1.14.4: the APK assets do, `sing-box-1.14.4-android-arm64.tar.gz`
-  does not), so a missing digest logs a warning and the install goes ahead on the
-  weaker chain: pinned release URL over TLS, exactly one expected binary in the
-  tarball, `version` equal to the tag, and `check` passing on the live config;
+  asset, so a broken download or a proxy that rewrites the body is rejected
+  (v1.14.4, measured 2026-11-21: 168 assets, 168 digests, and a tarball with
+  another sha256 refused with `sha256 mismatch`). Before that date the check
+  never ran against the real API: the digest sits behind a nested `uploader`
+  object, the parser looked for it on the wrong line, and every update logged
+  "publishes no sha256 digest" and went ahead — the note that used to be here,
+  that sing-box's tarballs have no digest, was that bug. An asset that really
+  has none still logs the warning and installs on the weaker chain: pinned
+  release URL over TLS, exactly one expected binary in the tarball, `version`
+  equal to the tag, and `check` passing on the live config;
 - the new binary has to answer `version` with the release tag and to pass
   `check -D run/update/check -c config/config.json` — a scratch `-D`, so the live
   `cache.db` is never touched. Only then are `bin/sing-box` and
@@ -347,11 +357,19 @@ connected the moment `pi-sing stop` ran (2026-11-05). The `ACCEPT` in
 
 `PISING_DIVERT` (PREROUTING, `-m socket --transparent`) marks and accepts packets
 of an already handled connection. `PISING_GUARD` (filter OUTPUT) rejects direct
-connections to the tproxy port and, with `quic=disable`, UDP 443/80.
+connections to the tproxy port on `127.0.0.1` and, with `quic=disable`, UDP
+443/80. `PISING_INPUT` (the first rule of mangle INPUT, IPv4 and IPv6, in every
+`ipv6=` mode) drops whatever else reaches the tproxy port without the TPROXY
+mark: the inbound listens on every address, and a connection made to the port
+itself — from the LAN, from a hotspot client, or from an app through the phone's
+own address or `[::1]` — makes the core dial itself (measured with 1.14.4: one
+TCP connection held for 1 s was ~30 s of looping, 110 878 fds and 37.5
+CPU-seconds). It sits in mangle, not filter, because netd rewrites the mark in
+between.
 `PISING_V6BLOCK` (filter OUTPUT/FORWARD, `ipv6=block`) rejects IPv6 except
 link-local/multicast, and rejects **global** IPv6 DNS. Link-local DNS is let
 through on purpose: see the DNS note in the trap list. `ipv6=disable` installs no
-IPv6 chain at all: it writes `disable_ipv6=1` (plus `accept_ra=0`, `autoconf=0`)
+IPv6 chain besides that guard: it writes `disable_ipv6=1` (plus `accept_ra=0`, `autoconf=0`)
 to every `/proc/sys/net/ipv6/conf/*` except `lo`, and `off`/`stop` puts the saved
 values back. Caveat: IMS (VoLTE/VoWiFi) talks IPv6 over `rmnet` on some carriers,
 so if calls stop working use `block` plus Android Private DNS (DoT) instead.
@@ -359,6 +377,13 @@ so if calls stop working use `block` plus Android Private DNS (DoT) instead.
 Routing: `ip rule add fwmark <fwmark> table 2027 pref 110` plus
 `ip route add local default dev lo table 2027` (the same for `ip -6` in
 `ipv6=proxy`).
+
+`on` and `renew` hand each table to `ip[6]tables-restore --noflush` as one
+commit, so the set is swapped in place and no packet sees a table without the
+hooks. The rebuild it replaces removed every rule first: in `module.log` on the
+device (5.25 days) that was 91 windows, 4 s at the median and 63 s at worst, in
+which traffic left unproxied and, with `ipv6=disable`, IPv6 was switched back on.
+Numbers and the fallback are in `docs/rules.md`.
 
 ### Ordering and Android-specific traps that were measured and fixed
 
@@ -477,6 +502,12 @@ resolver is a server with no `detour` at all.
   but adding it (`0x00400000`) is harmless.
 - If you point DNS at a resolver that is only reachable inside the tunnel, keep
   `dns-bootstrap` available for rule-set downloads.
+- `clash_api` (9090) and the `api` service (9091) of the shipped file have no
+  `"secret"`, and `127.0.0.1` is every app on the phone. Measured on the device
+  as uid 2000, without root: `:9090/configs` answered HTTP 200 and gRPC-Web
+  `GetVersion` on `:9091` `grpc-status: 0`, which is enough to read the
+  connections and switch outbounds. Give both a `"secret"`. `pi-sing start` logs
+  a warning for as long as one is missing; it does not edit the file.
 - After any edit: `su -c pi-sing restart` (or `iptables renew`).
 - The module rewrites three values on start so `settings.ini` stays in charge:
   the tproxy inbound's `listen_port`, `outbound.routing_mark` (when present) and

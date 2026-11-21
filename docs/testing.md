@@ -7,13 +7,25 @@ finding, not a flake.
 
 ```
 SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-check.sh
-SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 37/37 expected
-tests/update-core-test.sh                           # 44/44 expected, no device
+SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 55/55 expected
+tests/update-core-test.sh                           # 47/47 expected, no device
 tests/installer-test.sh                             # 67/67 expected, no device
-tests/cli-test.sh                                   # 38/38 expected, no device
+tests/cli-test.sh                                   # 56/56 expected, no device
 tests/action-test.sh                                # 32/32 expected, no device
 tools/build.sh                                      # smoke + the module zip (no core)
 ```
+
+The netns test resolves through `100.100.100.100` unless `PISING_TEST_DNS` names
+another resolver. Measured 2026-11-21 from this container (WiFi uplink) that
+address timed out, and the three assertions that need a name (`curl -> 200`,
+`connection entered tproxy-in`, `UDP/53 answered`) failed — on the previous
+commit as well, 34/37, so it is the resolver and not the rules.
+`PISING_TEST_DNS=1.1.1.1` gave 55/55.
+
+The same test polls the rule set while `renew` runs and connects to the tproxy
+port itself; on the rules of v1.8.6 those 13 assertions fail (a hook missing in
+186 of 253 listings, IPv6 back on in 30 162 of 41 366 reads, the core reached
+8 983 times by one self-dial).
 
 ## Device (root through android-bridge)
 

@@ -64,6 +64,8 @@ reset() {  # clean runtime state between cases
 # ------------------------------------------------------------------ sandbox
 mkdir -p "$DATA/bin" "$DATA/config" "$DATA/lists" "$DATA/run" "$MOD" "${TMP}/fakebin"
 cp "${ROOT}/module/payload/bin/pi-sing" "$DATA/bin/pi-sing"
+# service.sh runs the CLI by its path, and /system/bin/sh is the device's.
+sed -i '1s|^#!/system/bin/sh|#!/bin/sh|' "$DATA/bin/pi-sing"
 chmod 755 "$DATA/bin/pi-sing"
 # The rule set is one marker file, and `iptables -S` reports it: the module card
 # is derived from the real state, so a start without rules is not "running".
@@ -240,6 +242,64 @@ kill -9 "$(cat "$DATA/run/watchdog.pid" 2>/dev/null)" 2>/dev/null
 sed -i 's/^watchdog=.*/watchdog=0/' "$DATA/settings.ini"
 sed -i 's/^watchdog_interval=.*/watchdog_interval=30/' "$DATA/settings.ini"
 
+echo "== however the loop is started, one loop is left"
+# service.sh runs `pi-sing start` (whose ensure_watchdog spawns a loop) and then
+# `pi-sing watchdog`. Measured on the device 2026-11-21: two loops after every
+# boot (pids 3651 and 10920), 70 of 95 renews logged twice in the same second,
+# every rule in the mangle table twice.
+wd_pids() {
+    for _p in /proc/[0-9]*; do
+        case "${_p#/proc/}" in *[!0-9]*) continue ;; esac
+        # cat, not a redirect: a process can be gone between readdir and open.
+        cat "$_p/cmdline" 2>/dev/null | tr '\0' ' ' | grep -qF "$DATA/bin/pi-sing watchdog" &&
+            printf '%s\n' "${_p#/proc/}"
+    done
+}
+wd_kill() { for _p in $(wd_pids); do kill -9 "$_p" 2>/dev/null; done; }
+wd_n() { wd_pids | wc -l | tr -d ' '; }
+reset
+sed -i 's/^watchdog=.*/watchdog=1/' "$DATA/settings.ini"
+sed -i 's/^watchdog_interval=.*/watchdog_interval=1/' "$DATA/settings.ini"
+cli start >/dev/null 2>&1
+sleep 1
+# -k: a loop that does not leave by itself is not waited for (it ignores TERM).
+timeout -k 2 10 env PATH="${TMP}/fakebin:$PATH" PISING_DIR="$DATA" PISING_MOD_DIR="$MOD" PISING_QUIET=1 \
+    sh "$DATA/bin/pi-sing" watchdog >/dev/null 2>&1
+eq "$?" "0" "a second \`pi-sing watchdog\` returns while a loop is alive"
+eq "$(wd_n)" "1" "the loop that was there is still the only one"
+has "$DATA/run/log/module.log" "not starting a second loop" "the second loop says why it left"
+cli stop >/dev/null 2>&1
+wd_kill
+# The real service.sh, with only its data dir (and the /dev leftover it removes)
+# pointed at the sandbox: the boot path itself.
+reset
+rm -f "$DATA/run/watchdog.pid"
+sed -e "s|^DATA=/data/adb/pi-sing\$|DATA=${DATA}|" -e "s|/dev/pi-sing|${TMP}/dev-pi-sing|g" \
+    "${ROOT}/module/service.sh" > "${TMP}/service.sh"
+printf '#!/bin/sh\n[ "$1" = sys.boot_completed ] && echo 1\nexit 0\n' > "${TMP}/fakebin/getprop"
+printf '#!/bin/sh\necho "1.1.1.1 via 10.0.0.1 dev wlan0 src 10.0.0.2 uid 0"\n' > "${TMP}/fakebin/ip"
+chmod 755 "${TMP}/fakebin/getprop" "${TMP}/fakebin/ip"
+PATH="${TMP}/fakebin:$PATH" PISING_DIR="$DATA" PISING_MOD_DIR="$MOD" sh "${TMP}/service.sh"
+sleep 4
+cli status | grep -q '^process    : running' && ok "service.sh started the core" ||
+    bad "service.sh did not start the core"
+eq "$(wd_n)" "1" "service.sh's \`start\` + \`watchdog\` leave one loop"
+eq "$(cat "$DATA/run/watchdog.pid" 2>/dev/null)" "$(wd_pids)" "run/watchdog.pid names the loop that is alive"
+cli stop >/dev/null 2>&1
+wd_kill
+# Two loops started in the same instant both find no loop: the pid file settles
+# on one of them and the other leaves at its first wake-up.
+rm -f "$DATA/run/watchdog.pid"
+cli watchdog >/dev/null 2>&1 &
+cli watchdog >/dev/null 2>&1 &
+sleep 4
+eq "$(wd_n)" "1" "two loops started together settle on one"
+eq "$(cat "$DATA/run/watchdog.pid" 2>/dev/null)" "$(wd_pids)" "and the pid file names the survivor"
+wd_kill
+rm -f "${TMP}/fakebin/getprop" "${TMP}/fakebin/ip"
+sed -i 's/^watchdog=.*/watchdog=0/' "$DATA/settings.ini"
+sed -i 's/^watchdog_interval=.*/watchdog_interval=30/' "$DATA/settings.ini"
+
 echo "== a process that only mentions the core path is not the core"
 echo "== a name lookup that fails while 1.1.1.1 works turns the card orange"
 # Measured on the device: sing-box's DoH server had a detour through the tunnel,
@@ -288,6 +348,65 @@ cli stop >/dev/null 2>&1
 kill -0 "$DECOY" 2>/dev/null && ok "stop left the decoy alone" || bad "stop killed an unrelated process"
 kill -9 "$DECOY" 2>/dev/null
 wait "$DECOY" 2>/dev/null
+
+echo "== a pid file left by a previous boot does not pass for the core"
+# Measured on the device 2026-11-19 10:45:35: run/pi-sing.pid survived a reboot,
+# its pid was another process by then, `start` logged "already running (pid
+# 8143)" and the phone had no core and no rules for 85 s; the `stop` that
+# followed sent SIGTERM to that process.
+reset
+sleep 60 &
+STRAY=$!
+printf '%s\n' "$STRAY" > "$DATA/run/pi-sing.pid"
+cli status > "${TMP}/stale.out" 2>&1
+has "${TMP}/stale.out" "process    : stopped" "a live pid that is not the core reads as stopped"
+cli start >/dev/null 2>&1
+_core="$(cat "$DATA/run/pi-sing.pid" 2>/dev/null)"
+[ -n "$_core" ] && [ "$_core" != "$STRAY" ] &&
+    ok "start runs a core instead of answering 'already running' (pid $_core)" ||
+    bad "start trusted the stale pid file (pid ${_core:-none})"
+[ -f "${TMP}/rules.on" ] && ok "and installs the rules" || bad "no rules after a start over a stale pid file"
+printf '%s\n' "$STRAY" > "$DATA/run/pi-sing.pid"
+cli stop >/dev/null 2>&1
+kill -0 "$STRAY" 2>/dev/null && ok "stop left the unrelated process alone" ||
+    bad "stop killed the process the stale pid file named"
+cli status | grep -q '^process    : running' && bad "the core survived a stop over a stale pid file" ||
+    ok "and still stopped the real core"
+kill -9 "$STRAY" 2>/dev/null
+wait "$STRAY" 2>/dev/null
+
+echo "== another sing-box on the phone is not this module's core"
+# pidof matches the kernel's comm, so any process called sing-box (another
+# module's core, a second data dir) was taken for ours: `start` answered
+# "already running" and `stop` killed it.
+reset
+mkdir -p "${TMP}/other"
+cp "$(command -v sleep)" "${TMP}/other/sing-box"
+"${TMP}/other/sing-box" 60 &
+OTHER=$!
+sleep 0.3
+cli status > "${TMP}/other.out" 2>&1
+has "${TMP}/other.out" "process    : stopped" "a foreign sing-box does not read as running"
+cli stop >/dev/null 2>&1
+kill -0 "$OTHER" 2>/dev/null && ok "stop left the foreign sing-box alone" ||
+    bad "stop killed a sing-box that is not ours"
+kill -9 "$OTHER" 2>/dev/null
+wait "$OTHER" 2>/dev/null
+
+echo "== a control API without a secret is reported, the config is left alone"
+# Measured on the device 2026-11-21 as uid 2000, no root: :9090/configs answered
+# HTTP 200 and gRPC-Web GetVersion on :9091 grpc-status 0. The config is the
+# user's, so the module says it at start, the way it does for log.output.
+reset
+LEVEL=info write_config '"ui"'
+cli start >/dev/null 2>&1
+has "$DATA/run/log/module.log" 'with 0 "secret"' "an api service without a secret is reported at start"
+hasnt "$DATA/config/config.json" '"secret"' "the module puts no credential into the config"
+reset
+LEVEL=info write_config '"ui"'
+sed -i 's/"listen_port": 9099/"listen_port": 9099, "secret": "test-only"/' "$DATA/config/config.json"
+cli start >/dev/null 2>&1
+hasnt "$DATA/run/log/module.log" 'control API' "an api service with a secret is not reported"
 
 echo "== module.log rotates at 256 KiB"
 reset

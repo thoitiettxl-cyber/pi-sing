@@ -97,11 +97,16 @@ is_core_pid() {  # $1 = pid
 
 find_pid() {
     if command -v pidof >/dev/null 2>&1; then
-        _p="$(pidof "$bin_name" 2>/dev/null | awk '{ print $1 }')"
-        if [ -n "${_p:-}" ]; then
-            printf '%s' "$_p"
-            return 0
-        fi
+        # Only candidates: pidof matches the kernel's comm, so another module's
+        # sing-box (or a second data dir) read as this core, `start` answered
+        # "already running" and `stop` killed it. is_core_pid ties the pid to
+        # this bin_path.
+        for _cand in $(pidof "$bin_name" 2>/dev/null); do
+            if is_core_pid "$_cand"; then
+                printf '%s' "$_cand"
+                return 0
+            fi
+        done
     fi
     # pidof matches the kernel's comm, which is not bin_name when the core is a
     # script (or was renamed); the full command line still contains bin_path.
@@ -125,7 +130,13 @@ find_pid() {
 
 running_pid() {
     _pid="$(cat "$pid_file" 2>/dev/null)"
-    if [ -n "${_pid:-}" ] && kill -0 "$_pid" 2>/dev/null; then
+    # run/ outlives a reboot and a crashed core, and the pid in the file is
+    # somebody else's by then. Measured on the device 2026-11-19 10:45:35: the
+    # first start after a boot logged `already running (pid 8143)` for a pid
+    # written before that boot, so there was no core and no rule for 85 s, and
+    # the `stop` that followed logged `sing-box stopped (pid 8143)` - a SIGTERM
+    # to a process that was not ours. Alive is not enough: it has to be the core.
+    if [ -n "${_pid:-}" ] && kill -0 "$_pid" 2>/dev/null && is_core_pid "$_pid"; then
         printf '%s' "$_pid"
         return 0
     fi
@@ -401,6 +412,23 @@ check_config() {
     "$bin_path" check -D "$run_dir" -c "$config_path" $(core_flags) >> "$core_log" 2>&1
 }
 
+# clash_api and the `api` service answer anybody who reaches the port when they
+# have no "secret" (sing-box docs: "If empty, authentication is disabled"), and
+# 127.0.0.1 is every app on the phone. Measured on the device 2026-11-21 as
+# uid 2000, no root: :9090/configs -> HTTP 200, gRPC-Web GetVersion on :9091 ->
+# grpc-status 0, `Access-Control-Allow-Origin: *`. That is enough to read every
+# connection and to switch outbounds. Advice only, like log.output: the config
+# is the user's and the module does not put a credential into it.
+warn_open_api() {
+    _apis=$(( $(grep -o -e '"external_controller"[[:space:]]*:[[:space:]]*"[^"]' \
+                        -e '"type"[[:space:]]*:[[:space:]]*"api"' "$config_path" 2>/dev/null | wc -l) ))
+    [ "$_apis" -gt 0 ] || return 0
+    _secrets=$(( $(grep -o '"secret"[[:space:]]*:[[:space:]]*"[^"]' "$config_path" 2>/dev/null | wc -l) ))
+    [ "$_secrets" -ge "$_apis" ] && return 0
+    log Warn "config: ${_apis} control API(s) (clash_api / services type api) with ${_secrets} \"secret\": any app on the phone can read the connections and switch outbounds; set a secret, the module does not edit the config"
+    return 0
+}
+
 # One core log per run. The previous one stays as sing-box.log.1, so the reason
 # a core died can still be read after the next start, and the file never grows
 # forever on a phone that does not reboot.
@@ -529,6 +557,7 @@ do_start() {
     # the rules went in). Advice only; the module does not edit the config.
     grep -q '"output"[[:space:]]*:' "$config_path" 2>/dev/null &&
         log Warn "config: log.output is set; the module redirects the core to ${core_log}, and a path that does not exist is fatal at start"
+    warn_open_api
     log Info "starting ${bin_name} (log: ${core_log})"
     # shellcheck disable=SC2046
     start_core "$bin_path" run -D "$run_dir" -c "$config_path" $(core_flags)
@@ -745,18 +774,22 @@ do_update_core() {
         return 0
     fi
 
-    # The digest sits in the same asset object as the name, and the split above
-    # puts one object per line, so the name and its digest are on the same line:
-    # take the digest from the line that carries this asset's name.
-    _want="$(grep -F "\"${_tar}\"" "${_upd}/release.split" 2>/dev/null |
+    # The digest is in the same asset object as the name, but not on the same
+    # line of the split: GitHub nests an `uploader` object between `name` and
+    # `digest`, and the split breaks the asset there. Measured 2026-11-21 against
+    # the live API (v1.14.4: 168 assets, 168 digests): the quoted name matched
+    # one line, the digest sat on the next, so every update logged "publishes no
+    # sha256 digest" and a tarball with another sha256 was installed with rc 0.
+    # That next line ends with browser_download_url, which ends in the same file
+    # name, so the digest is taken from either line.
+    _want="$(grep -F -e "\"${_tar}\"" -e "/${_tar}\"" "${_upd}/release.split" 2>/dev/null |
         sed -n 's/.*"digest"[[:space:]]*:[[:space:]]*"sha256:\([0-9a-f][0-9a-f]*\)".*/\1/p' |
         head -n 1)"
-    # No digest is not an error: GitHub only publishes `digest` for assets
-    # uploaded after it introduced the field, and this project's tarballs do not
-    # have one (`sing-box-1.14.4-android-arm64.tar.gz` measured: the APK assets
-    # carry a digest, the tarball has no such key). The download is still pinned
-    # to the release URL over TLS, must extract exactly the expected binary, must
-    # report the release tag, and must pass `check` against the live config.
+    # An asset that really has no digest is not refused: GitHub only publishes
+    # the field for assets uploaded after it was introduced, and a mirror may
+    # drop it. The download is still pinned to the release URL over TLS, must
+    # extract exactly the expected binary, must report the release tag, and must
+    # pass `check` against the live config.
     if [ -z "${_want:-}" ]; then
         log Warn "update: ${_tag} publishes no sha256 digest for ${_tar}; verifying by version and check only"
     fi
@@ -855,6 +888,17 @@ v6_drift() {
 
 do_watchdog() {
     [ "$watchdog" = "1" ] || { log Info "watchdog disabled"; return 0; }
+    # One loop per data dir. service.sh runs `start`, whose ensure_watchdog
+    # spawns a loop, and then `watchdog` itself, so every boot ended with two.
+    # Measured on the device 2026-11-21: pids 3651 and 10920 were both
+    # `pi-sing watchdog` since the boot of 11-19, 70 of 95 renews were logged
+    # twice in the same second, three rule builds ran into each other, and the
+    # mangle table held every rule twice (PISING_EXT: 74 rules, 23 distinct).
+    # `$$` is excluded: the re-exec below comes back here with the same pid.
+    if watchdog_alive && [ "$_wpid" != "$$" ]; then
+        log Info "watchdog already running (pid ${_wpid}), not starting a second loop"
+        return 0
+    fi
     log Info "watchdog started (${watchdog_interval}s)"
     # `ensure_watchdog` trusts this pid only together with the command line, so
     # it has to be this process': `exec` below keeps the same pid.
@@ -879,6 +923,19 @@ do_watchdog() {
     _waited=0
     while :; do
         sleep "$_v6_int"
+        # Two loops started in the same instant both get past the check at the
+        # top, and the file keeps whichever pid was written last. The other
+        # loop leaves here, at its first wake-up, before it has done any work;
+        # a file that is gone or names a dead process is taken back instead.
+        _wd_now=""
+        [ -f "${run_dir}/watchdog.pid" ] && read -r _wd_now < "${run_dir}/watchdog.pid"
+        if [ "${_wd_now:-}" != "$$" ]; then
+            if watchdog_alive; then
+                log Info "watchdog: pid ${_wpid} owns the loop, pid $$ exits"
+                return 0
+            fi
+            printf '%s\n' "$$" > "${run_dir}/watchdog.pid" 2>/dev/null
+        fi
         _waited=$((_waited + _v6_int))
         if [ ! -f "$state_file" ] && v6_drift; then
             PISING_QUIET=1 "${bin_dir}/pi.iptables" v6enforce >/dev/null 2>&1

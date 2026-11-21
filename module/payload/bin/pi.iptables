@@ -23,6 +23,14 @@
 #    ipv6=disable switches the IPv6 stack off (sysctl), so netd has no IPv6
 #    resolver left to leak through, ipv6=off does nothing (IPv6 goes direct).
 #
+#  * `on`/`renew` replace the rule set in place: one ip[6]tables-restore
+#    --noflush transaction per table, so no packet sees a table without the
+#    hooks. A table that refuses its batch gets the old path instead (remove
+#    everything, then one rule at a time), and the log says so.
+#  * mangle INPUT drops whatever reaches the tproxy port without the TPROXY
+#    mark, for IPv4 and IPv6 and in every ipv6= mode: a connection made to the
+#    port itself makes the core dial itself.
+#
 # PISING_DRY_RUN=1 prints every command instead of running it: the only way to
 # see what a ROM with unusual chains would get without breaking the network.
 set -u
@@ -71,8 +79,32 @@ dry() {
     return 0
 }
 
-i4() { dry iptables $IPT_WAIT "$@" && return 0; iptables $IPT_WAIT "$@"; }
-i6() { dry ip6tables $IPT_WAIT "$@" && return 0; ip6tables $IPT_WAIT "$@"; }
+# `on` hands each table to ip[6]tables-restore as one transaction (batch_commit
+# below): while BATCH is set, i4/i6 record the rule instead of running it, and
+# the builders do not know the difference. Recorded in variables, not files:
+# printf is an external command in Android's mksh, one fork per rule.
+BATCH=""
+B_MANGLE=""
+B_FILTER=""
+NL='
+'
+batch_add() {  # -t <table> <rule...>, the way every builder calls i4/i6
+    _btab="$2"; shift 2
+    case "$_btab" in
+        mangle) B_MANGLE="${B_MANGLE}$*${NL}" ;;
+        filter) B_FILTER="${B_FILTER}$*${NL}" ;;
+    esac
+    return 0
+}
+
+i4() {
+    [ -n "$BATCH" ] && { batch_add "$@"; return 0; }
+    dry iptables $IPT_WAIT "$@" && return 0; iptables $IPT_WAIT "$@"
+}
+i6() {
+    [ -n "$BATCH" ] && { batch_add "$@"; return 0; }
+    dry ip6tables $IPT_WAIT "$@" && return 0; ip6tables $IPT_WAIT "$@"
+}
 
 # Write-side `ip` wrapper; read-side calls (`ip rule show`) stay real.
 ipw() {  # $1 = 4|6, rest = ip arguments
@@ -95,6 +127,7 @@ c_local="PISING_LOCAL"  # OUTPUT, mark
 c_divert="PISING_DIVERT" # PREROUTING, already handled sockets
 c_bypass="PISING_BYPASS" # PREROUTING, ACCEPT private/local destinations
 c_guard="PISING_GUARD"  # filter OUTPUT, reject direct tproxy port and QUIC
+c_input="PISING_INPUT"  # mangle INPUT, drop the tproxy port unless TPROXY'd
 c_v6="PISING_V6BLOCK"   # filter OUTPUT/FORWARD, reject IPv6 in ipv6=block
 
 # 198.18.0.0/15 and fc00::/18 are deliberately absent: sing-box fakeip uses
@@ -342,22 +375,73 @@ build_guard() {
     esac
 }
 
+# Nothing but a TPROXY'd packet may reach the tproxy port. The inbound listens on
+# every address ("listen": "::"), and a connection made *to* the port has the
+# port itself as its destination: the core dials it, which is itself, and every
+# dial is the next inbound connection. Measured 2026-11-21 in a netns with
+# sing-box 1.14.4 and these rules: one TCP connection held for 1 s by a LAN
+# neighbour kept the core busy for ~30 s (110 878 fds, 37.5 CPU-seconds, RSS
+# 26 -> 265 MiB), one UDP datagram was 19 307 inbound packet connections in 5 s
+# and still going, and an app on the phone got there too, through the phone's
+# own LAN address or [::1]. The 127.0.0.1 rule in PISING_GUARD covers none of
+# that. A packet TPROXY delivered carries the fwmark (--tproxy-mark, or
+# PISING_DIVERT) and still has the destination the app asked for, so "to the
+# tproxy port and not marked" is exactly a connection to the listener itself;
+# a proxied connection to <somewhere>:<tproxy_port> is marked and passes.
+# The chain is hooked first in *mangle* INPUT, and DROP is all mangle has: by
+# the time the filter table sees the packet the mark is netd's. Read on the
+# device 2026-11-21: `-A routectrl_mangle_INPUT -i wlan0 -j MARK --set-xmark
+# 0x300cd/0x7fefffff`, one such rule per interface netd manages, and that mask
+# covers the fwmark bit - a REJECT in filter INPUT would have refused a hotspot
+# client's proxied connection to port <tproxy_port> as well.
+build_input() {
+    _ipt="$1"
+    $_ipt -t mangle -A "$c_input" -p tcp --dport "$tproxy_port" -m mark ! --mark "$fwmark" -j DROP
+    $_ipt -t mangle -A "$c_input" -p udp --dport "$tproxy_port" -m mark ! --mark "$fwmark" -j DROP
+}
+
+# build_input for the IPv6 side of the modes that install no other IPv6 rule set:
+# the inbound is dual-stack whatever `ipv6=` says.
+apply_input() {  # $1 = i4|i6
+    _ipt="$1"
+    if [ -z "$BATCH" ]; then
+        $_ipt -t mangle -N "$c_input" 2>/dev/null
+        $_ipt -t mangle -F "$c_input" 2>/dev/null
+    fi
+    build_input "$_ipt"
+    [ -n "$BATCH" ] && return 0
+    $_ipt -t mangle -I INPUT -j "$c_input"
+    return 0
+}
+
 apply_proto() {
     _ipt="$1"            # i4 | i6
     _fam="$2"            # 4 | 6
-    ipw "$_fam" rule add fwmark "$fwmark" table "$table" pref "$pref" 2>/dev/null
+    # `on` does not remove the rule first any more, and a second `rule add` is
+    # a second rule on a kernel that does not refuse it.
+    case "$_fam" in
+        6) _have="$(ip -6 rule show 2>/dev/null)" ;;
+        *) _have="$(ip rule show 2>/dev/null)" ;;
+    esac
+    case "${_have}${NL}" in
+        *"lookup ${table}${NL}"*|*"lookup ${table} "*) ;;
+        *) ipw "$_fam" rule add fwmark "$fwmark" table "$table" pref "$pref" 2>/dev/null ;;
+    esac
     ipw "$_fam" route replace local default dev lo table "$table" 2>/dev/null ||
         log Error "cannot add local default route to table ${table}"
 
-    for _c in "$c_ext" "$c_local" "$c_divert" "$c_bypass"; do
-        $_ipt -t mangle -N "$_c" 2>/dev/null
-        $_ipt -t mangle -F "$_c" 2>/dev/null
-    done
-    # v1.8.5 and older kept the intranet RETURNs in this nested chain.
-    $_ipt -t mangle -F PISING_SKIP 2>/dev/null
-    $_ipt -t mangle -X PISING_SKIP 2>/dev/null
-    $_ipt -t filter -N "$c_guard" 2>/dev/null
-    $_ipt -t filter -F "$c_guard" 2>/dev/null
+    # A batch names its chains instead: created or flushed in the same commit.
+    if [ -z "$BATCH" ]; then
+        for _c in "$c_ext" "$c_local" "$c_divert" "$c_bypass" "$c_input"; do
+            $_ipt -t mangle -N "$_c" 2>/dev/null
+            $_ipt -t mangle -F "$_c" 2>/dev/null
+        done
+        # v1.8.5 and older kept the intranet RETURNs in this nested chain.
+        $_ipt -t mangle -F PISING_SKIP 2>/dev/null
+        $_ipt -t mangle -X PISING_SKIP 2>/dev/null
+        $_ipt -t filter -N "$c_guard" 2>/dev/null
+        $_ipt -t filter -F "$c_guard" 2>/dev/null
+    fi
 
     if [ "$_fam" = 6 ]; then
         build_skip "$_ipt" "$c_bypass" "$intranet6 $(local_addrs 6)" ACCEPT
@@ -367,10 +451,14 @@ apply_proto() {
     build_ext "$_ipt" "${3:-no}"
     build_local "$_ipt" "${3:-no}" "$_fam"
     build_guard "$_ipt"
+    build_input "$_ipt"
 
     # Already-handled socket (established tproxy connection): mark and accept.
     $_ipt -t mangle -A "$c_divert" -j MARK --set-xmark "$fwmark"
     $_ipt -t mangle -A "$c_divert" -j ACCEPT
+
+    # A batch puts the hooks back itself, in the commit that refills the chains.
+    [ -n "$BATCH" ] && return 0
 
     $_ipt -t mangle -I PREROUTING -j "$c_ext"
     if $_ipt -t mangle -I PREROUTING -p tcp -m socket --transparent -j "$c_divert" 2>/dev/null; then
@@ -379,14 +467,17 @@ apply_proto() {
         log Warn "xt_socket mangle PREROUTING unsupported, skipping DIVERT"
     fi
     $_ipt -t mangle -I OUTPUT -j "$c_local"
+    $_ipt -t mangle -I INPUT -j "$c_input"
     $_ipt -t filter -I OUTPUT -j "$c_guard"
     return 0
 }
 
 # ipv6=block: IPv6 is not proxied, so it must not reach the network either.
 apply_v6_block() {
-    i6 -t filter -N "$c_v6" 2>/dev/null
-    i6 -t filter -F "$c_v6" 2>/dev/null
+    if [ -z "$BATCH" ]; then
+        i6 -t filter -N "$c_v6" 2>/dev/null
+        i6 -t filter -F "$c_v6" 2>/dev/null
+    fi
     # Link-local and multicast stay untouched *before* the DNS reject, because a
     # link-local resolver is the only working one on some networks: netd held
     # fe80::1%wlan0 as its resolver while 1.1.1.1/1.0.0.1 were marked BROKEN
@@ -402,6 +493,7 @@ apply_v6_block() {
     i6 -t filter -A "$c_v6" -p udp --dport 53 -j REJECT
     i6 -t filter -A "$c_v6" -p tcp --dport 53 -j REJECT --reject-with tcp-reset
     i6 -t filter -A "$c_v6" -j REJECT
+    [ -n "$BATCH" ] && return 0
     i6 -t filter -I OUTPUT -j "$c_v6"
     i6 -t filter -I FORWARD -j "$c_v6"
     return 0
@@ -415,11 +507,12 @@ teardown_proto() {
     # the match spec must be identical to the inserted rule or -D does not match
     del_all "$_ipt" -t mangle -D PREROUTING -p tcp -m socket --transparent -j "$c_divert"
     del_all "$_ipt" -t mangle -D OUTPUT -j "$c_local"
+    del_all "$_ipt" -t mangle -D INPUT -j "$c_input"
     del_all "$_ipt" -t filter -D OUTPUT -j "$c_guard"
     del_all "$_ipt" -t filter -D OUTPUT -j "$c_v6"
     del_all "$_ipt" -t filter -D FORWARD -j "$c_v6"
 
-    for _c in "$c_ext" "$c_local" "$c_divert" "$c_bypass" PISING_SKIP; do
+    for _c in "$c_ext" "$c_local" "$c_divert" "$c_bypass" "$c_input" PISING_SKIP; do
         $_ipt -t mangle -F "$_c" 2>/dev/null
         $_ipt -t mangle -X "$_c" 2>/dev/null
     done
@@ -433,6 +526,133 @@ teardown_proto() {
         _n=$((_n + 1))
     done
     ipw "$_fam" route flush table "$table" 2>/dev/null
+    return 0
+}
+
+# ------------------------------------------------- one transaction per table
+#
+# `on` used to remove every rule and then build the set again, one iptables call
+# per rule (108 of them). Measured in module.log on the device, 2026-11-16..21
+# (5.25 days): 91 rebuilds, the rules gone for a median of 4 s, p90 14 s, 63 s
+# at worst - 128 s a day in which IPv4 left unproxied, port 53 was not hijacked
+# and, with ipv6=disable, the IPv6 stack was switched back on, each time right
+# after the network had changed. ip[6]tables-restore --noflush replaces a table
+# in one commit (it is how netd writes its own rules): a chain named in the
+# batch is created or flushed and refilled, our hooks are taken out and put back
+# on top, and no packet ever sees the table without them.
+
+# What the last `on` installed for IPv6 (the ipv6_mode word). Its absence means
+# there is nothing `on` may build on.
+rules_stamp="${run_dir}/rules.ipv6"
+
+# Our hooks as they are in a table right now, as deletes for the batch. Every
+# occurrence is listed, so a hook that was doubled, or pushed down by somebody
+# else's -I, is there once and first again after the commit.
+hook_deletes() {  # $1 = iptables|ip6tables, $2 = table
+    "$1" $IPT_WAIT -t "$2" -S 2>/dev/null |
+        awk '$1 == "-A" && $2 !~ /^PISING_/ && $(NF - 1) == "-j" && $NF ~ /^PISING_/ { $1 = "-D"; print }'
+}
+
+# $1 = 4|6, $2 = table, $3 = the chains the batch owns, $4 = their rules,
+# $5 = our hooks as they are now (hook_deletes), $6 = the hooks to put back, in
+# -I order (the last one ends up first)
+batch_commit() {
+    case "$1" in
+        6) _bres=ip6tables-restore ;;
+        *) _bres=iptables-restore ;;
+    esac
+    _btxt="*${2}${NL}"
+    for _c in $3; do
+        _btxt="${_btxt}:${_c} - [0:0]${NL}"
+    done
+    _btxt="${_btxt}${4}${5:+${5}${NL}}${6}COMMIT"
+    # The batch goes down a pipe from `echo`, the one builtin for that in both
+    # mksh and dash. Not printf: on Android it is an external command, a rule set
+    # past 128 KiB does not fit its argument, and the restore would then read an
+    # empty stdin and report success with nothing committed. echo interprets
+    # backslashes in both shells, and no rule of ours has one.
+    case "$_btxt" in
+        *\\*) log Warn "a rule for ${2} contains a backslash, ${_bres} not used"; return 1 ;;
+    esac
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "$_btxt" | sed "s/^/[dry-run] ${_bres} --noflush: /" >&2
+        return 0
+    fi
+    _berr="$(echo "$_btxt" | "$_bres" $IPT_WAIT --noflush 2>&1)" && return 0
+    log Warn "${_bres} refused the ${2} batch: $(printf '%s' "$_berr" | tr '\n' ' ')"
+    return 1
+}
+
+# apply_proto's rule set for one family, committed table by table.
+batch_proto() {  # $1 = i4|i6, $2 = 4|6 -> 1 when a table refused its batch
+    case "$2" in
+        6) _blst=ip6tables ;;
+        *) _blst=iptables ;;
+    esac
+    BATCH=1; B_MANGLE=""; B_FILTER=""
+    apply_proto "$1" "$2"
+    BATCH=""
+    _bdel="$(hook_deletes "$_blst" mangle)"
+    _bins="-I PREROUTING -j ${c_ext}${NL}"
+    # xt_socket is not in every kernel, and one unknown match fails the whole
+    # batch. The DIVERT hook is part of it only once it is known to work, which
+    # is when it is already there; the first time it is tried on its own, below.
+    case "$_bdel" in
+        *"-j ${c_divert}"*)
+            _bins="${_bins}-I PREROUTING -p tcp -m socket --transparent -j ${c_divert}${NL}"
+            _bdiv=1 ;;
+        *)  _bdiv=0 ;;
+    esac
+    _bins="${_bins}-I OUTPUT -j ${c_local}${NL}-I INPUT -j ${c_input}${NL}"
+    batch_commit "$2" mangle "$c_ext $c_local $c_divert $c_bypass $c_input" "$B_MANGLE" "$_bdel" "$_bins" || return 1
+    if [ "$_bdiv" = 0 ] &&
+       ! $1 -t mangle -I PREROUTING -p tcp -m socket --transparent -j "$c_divert" 2>/dev/null; then
+        log Warn "xt_socket mangle PREROUTING unsupported, skipping DIVERT"
+    fi
+    batch_commit "$2" filter "$c_guard" "$B_FILTER" "$(hook_deletes "$_blst" filter)" \
+        "-I OUTPUT -j ${c_guard}${NL}" || return 1
+    return 0
+}
+
+# IPv6 in the modes that do not proxy it: the tproxy-port guard (every mode)
+# and the block chain (ipv6=block).
+batch_v6_rest() {  # $1 = ipv6 mode
+    BATCH=1; B_MANGLE=""; B_FILTER=""
+    apply_input i6
+    [ "$1" = block ] && apply_v6_block
+    BATCH=""
+    batch_commit 6 mangle "$c_input" "$B_MANGLE" "$(hook_deletes ip6tables mangle)" \
+        "-I INPUT -j ${c_input}${NL}" || return 1
+    [ "$1" = block ] || return 0
+    batch_commit 6 filter "$c_v6" "$B_FILTER" "$(hook_deletes ip6tables filter)" \
+        "-I OUTPUT -j ${c_v6}${NL}-I FORWARD -j ${c_v6}${NL}"
+}
+
+on_batch() {  # $1 = ipv6 mode -> 1 as soon as a table refuses its batch
+    batch_proto i4 4 || return 1
+    case "$1" in
+        proxy) batch_proto i6 6 || return 1 ;;
+        *)     batch_v6_rest "$1" || return 1 ;;
+    esac
+    # ipv6=disable: what `on` switched off stays off across a renew. Putting
+    # the stack back first, as the rebuild did, is IPv6 on for as long as the
+    # rebuild takes. The first `on` records and disables every interface, a
+    # later one only what netd turned on again.
+    if [ "$1" = disable ]; then
+        if [ -f "$v6_stack_saved" ]; then enforce_v6_disable; else apply_v6_disable; fi
+    fi
+    return 0
+}
+
+# The rule-by-rule build, on a table `do_off quiet` has just emptied.
+on_rules() {  # $1 = ipv6 mode
+    apply_proto i4 4
+    case "$1" in
+        proxy)   apply_proto i6 6 ;;
+        block)   apply_v6_block; apply_input i6 ;;
+        disable) apply_v6_disable; apply_input i6 ;;
+        *)       apply_input i6 ;;
+    esac
     return 0
 }
 
@@ -566,16 +786,25 @@ do_on() {
     iptables $IPT_WAIT -t mangle -S >/dev/null 2>&1 || { log Error "mangle table unavailable"; return 1; }
     read_uid_list
     read_ap_list
-    do_off quiet
-
-    apply_proto i4 4
     _v6="$(ipv6_mode)"
-    case "$_v6" in
-        proxy)   apply_proto i6 6 ;;
-        block)   apply_v6_block ;;
-        disable) apply_v6_disable ;;
-        *)       log Warn "ipv6=off: IPv6 traffic is NOT proxied and can leak" ;;
-    esac
+    # What the previous `on` left decides what has to go first; when nothing
+    # changed, nothing does, and the set is swapped in place. No stamp is a
+    # first `on`, or rules from a version that could not swap in place: start
+    # from a clean table. Another ipv6 mode: only that mode's IPv6 side goes.
+    _was="$(cat "$rules_stamp" 2>/dev/null)"
+    if [ -z "$_was" ]; then
+        do_off quiet
+    elif [ "$_was" != "$_v6" ]; then
+        restore_v6_stack
+        teardown_proto i6 6
+    fi
+    if ! on_batch "$_v6"; then
+        log Warn "falling back to the rule-by-rule build: the set is removed first, so the proxy is off until it is back"
+        do_off quiet
+        on_rules "$_v6"
+    fi
+    [ "$DRY_RUN" = "1" ] || printf '%s\n' "$_v6" > "$rules_stamp" 2>/dev/null
+    [ "$_v6" = off ] && log Warn "ipv6=off: IPv6 traffic is NOT proxied and can leak"
     # One result line per `on`: the settings are in settings.ini, repeating them
     # on every renew is what made the logs noisy.
     log Info "rules installed: ${tproxy_port}/tcp+udp, table ${table}, mode ${proxy_mode}, ipv6 ${_v6}"
@@ -586,6 +815,7 @@ do_off() {  # $1 = quiet (called from do_on, which reinstalls right away)
     restore_v6_stack
     teardown_proto i4 4
     teardown_proto i6 6
+    [ "$DRY_RUN" = "1" ] || rm -f "$rules_stamp"
     [ "${1:-}" = "quiet" ] || log Info "TPROXY rules removed"
     return 0
 }

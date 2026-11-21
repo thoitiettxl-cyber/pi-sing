@@ -8,6 +8,10 @@
 #   4. a uid listed in blacklist mode bypasses the proxy
 #   5. the core's own traffic (gid bypass) is not captured -> no loop
 #   6. `pi-sing stop` removes every rule it added
+#   7. `renew` swaps the rule set in place: the hooks are there in every listing
+#      taken while it runs, and ipv6=disable never switches IPv6 back on
+#   8. a table that refuses its batch falls back to the rule-by-rule build
+#   9. the tproxy port only answers TPROXY'd traffic (no self-dial loop)
 #
 # Requirements: root, iproute2, iptables, curl, python3, setpriv, xt_TPROXY.
 set -u
@@ -29,6 +33,7 @@ FAIL=0
 
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS + 1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL + 1)); }
+eq()   { [ "$1" = "$2" ] && ok "$3" || bad "$3 (got '$1', want '$2')"; }
 note() { printf '  ---- %s\n' "$1"; }
 ns()   { ip netns exec "$NS" "$@"; }
 count_inbound() { grep -c 'inbound connection to' "$CORE_LOG" 2>/dev/null; }
@@ -72,22 +77,52 @@ cp "$PAYLOAD/settings.ini" "$DATA/"
 # The test reads connection lines from the core log, so do not let the module's
 # warn default silence them here.
 printf 'core_log_level="config"\n' >> "$DATA/settings.ini"
+# No watchdog: nothing here tests it, a loop that renews on its own would run
+# between the assertions, and `start` leaves it behind when the test ends
+# (measured 2026-11-21: five runs, five `pi-sing watchdog` loops still alive).
+printf 'watchdog=0\n' >> "$DATA/settings.ini"
 cp "$PAYLOAD/config/config.example.json" "$DATA/config/config.json"
 cp "$PAYLOAD/lists/package.list.cfg" "$PAYLOAD/lists/ap.list.cfg" "$DATA/lists/"
 cp "$SINGBOX_BIN" "$DATA/bin/sing-box"
 # The payload targets Android (/system/bin/sh); point it at the host shell here.
 sed -i '1s|.*|#!/bin/sh|' "$DATA/bin/pi-sing" "$DATA/bin/pi.iptables"
 # Readable logs + a plain UDP resolver (DoH to 1.1.1.1 is blocked in CI/sandboxes).
-python3 - "$DATA/config/config.json" <<'PY'
+# PISING_TEST_DNS names another one when this one does not answer: measured
+# 2026-11-21 from this container (WiFi uplink) 100.100.100.100:53 timed out,
+# and the curl and UDP/53 assertions then fail on a rule set that is fine
+# (3 failures, on the previous commit too); 1.1.1.1 answered.
+python3 - "$DATA/config/config.json" "${PISING_TEST_DNS:-100.100.100.100}" <<'PY'
 import json, sys
 p = sys.argv[1]
 c = json.load(open(p))
 c['log']['level'] = 'info'
-c['dns']['servers'] = [{"type": "udp", "tag": "dns-remote", "server": "100.100.100.100"},
+c['dns']['servers'] = [{"type": "udp", "tag": "dns-remote", "server": sys.argv[2]},
                        {"type": "local", "tag": "dns-local"}]
 json.dump(c, open(p, 'w'), indent=2)
 PY
 chmod +x "$DATA/bin/pi-sing" "$DATA/bin/pi.iptables" "$DATA/bin/sing-box"
+# One connection (tcp) or one datagram (udp) to port 1536 of a host. tcp prints
+# connected | timeout | refused; a dropped SYN is a timeout.
+cat > "${TMP}/probe.py" <<'PY'
+import socket, sys
+kind, host = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET,
+                  socket.SOCK_STREAM if kind == 'tcp' else socket.SOCK_DGRAM)
+s.settimeout(2)
+try:
+    s.connect((host, 1536))
+    if kind == 'udp':
+        s.send(b'x')
+        print('sent')
+    else:
+        print('connected')
+except ConnectionRefusedError:
+    print('refused')
+except socket.timeout:
+    print('timeout')
+except OSError as e:
+    print(e.__class__.__name__)
+PY
 
 echo "== start"
 ns env PISING_DIR="$DATA" "$DATA/bin/pi-sing" start
@@ -121,6 +156,54 @@ print('rcode=%d answers=%d src=%s' % (flags & 0xF, struct.unpack('>H', d[6:8])[0
 PY
 grep -q 'rcode=0' "${TMP}/dns.out" && ok "UDP/53 answered by sing-box ($(tr -d '\n' < "${TMP}/dns.out"))" ||
     { bad "UDP/53 hijack failed"; note "$(cat "${TMP}/dns.out")"; }
+
+echo "== renew swaps the rule set in place"
+# `renew` used to remove every rule and then build the set again, one iptables
+# call per rule. Measured in module.log on the device (2026-11-16..21): the
+# rules were gone for a median of 4 s per renew, 63 s at worst, 128 s a day,
+# always right after the network changed; in a namespace like this one a poller
+# found a hook missing in 350 of 572 listings. A table is one commit now.
+hooks_now() {
+    ns iptables -w 5 -t mangle -S 2>/dev/null |
+        awk '/^-A OUTPUT -j PISING_LOCAL$/ { o++ } /^-A PREROUTING -j PISING_EXT$/ { p++ } END { print o + 0, p + 0 }'
+}
+rm -f "${TMP}/poll.stop"
+( while [ ! -f "${TMP}/poll.stop" ]; do hooks_now; done > "${TMP}/poll.out" ) &
+POLLER=$!
+sleep 0.3
+for _i in 1 2 3 4 5; do
+    ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+done
+sleep 0.3
+: > "${TMP}/poll.stop"
+wait "$POLLER" 2>/dev/null
+_samples="$(wc -l < "${TMP}/poll.out" | tr -d ' ')"
+_gaps="$(grep -cv '^1 1$' "${TMP}/poll.out")"
+[ "$_samples" -ge 20 ] && [ "$_gaps" -eq 0 ] &&
+    ok "5 renews, ${_samples} listings of the table: both hooks in every one, once" ||
+    bad "${_gaps} of ${_samples} listings saw a hook missing or doubled during a renew"
+[ "$(ns ip rule show 2>/dev/null | grep -c 'lookup 2027')" = "1" ] &&
+    ok "still one ip rule after the renews" || bad "the renews changed the number of ip rules"
+# What two builders running into each other left on the device (2026-11-21:
+# both hooks twice, PISING_EXT 74 rules for 23 distinct ones).
+ns iptables -t mangle -I OUTPUT -j PISING_LOCAL
+ns iptables -t mangle -I PREROUTING -j PISING_EXT
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+[ "$(hooks_now)" = "1 1" ] && ok "a doubled hook is single again after one renew" ||
+    bad "the hooks are not single after a renew ($(hooks_now))"
+# A table that refuses its batch gets the rule-by-rule build, and the log says
+# that the proxy was off meanwhile.
+mkdir -p "${TMP}/norestore"
+printf '#!/bin/sh\necho "iptables-restore: line 2 failed" >&2\nexit 1\n' > "${TMP}/norestore/iptables-restore"
+chmod 755 "${TMP}/norestore/iptables-restore"
+ns env PATH="${TMP}/norestore:$PATH" PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+[ "$(hooks_now)" = "1 1" ] &&
+    ns iptables -t mangle -S PISING_LOCAL | grep -q -- '-d 10.0.0.0/8 -j RETURN' &&
+    ok "without iptables-restore the rule-by-rule build installs the set" ||
+    bad "no rule set after a refused batch"
+grep -q 'falling back to the rule-by-rule build' "$MOD_LOG" && ok "and the fallback is in module.log" ||
+    bad "the fallback was silent"
+ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
 
 echo "== intranet destinations stay direct (OUTPUT path)"
 # The RETURNs must sit in PISING_LOCAL itself: a RETURN inside a chain that
@@ -250,6 +333,31 @@ ns sh -c 'echo 0 > /proc/sys/net/ipv6/conf/vns0/disable_ipv6' 2>/dev/null
 ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" v6enforce >/dev/null 2>&1
 [ "$(ns cat /proc/sys/net/ipv6/conf/vns0/disable_ipv6 2>/dev/null)" = "1" ] &&
     ok "\`v6enforce\` switches IPv6 off again after netd turned it on" || bad "enforce left IPv6 on"
+# A renew used to put the stack back before taking it away again: IPv6 was on
+# for as long as the IPv4 rebuild took (62% of the samples in this poll).
+rm -f "${TMP}/poll.stop"
+ns sh -c "while [ ! -f '${TMP}/poll.stop' ]; do v=; read v < /proc/sys/net/ipv6/conf/vns0/disable_ipv6; echo \"\$v\"; done" \
+    > "${TMP}/poll6.out" 2>/dev/null &
+POLLER=$!
+sleep 0.2
+for _i in 1 2 3; do
+    ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+done
+sleep 0.2
+: > "${TMP}/poll.stop"
+wait "$POLLER" 2>/dev/null
+_samples="$(wc -l < "${TMP}/poll6.out" | tr -d ' ')"
+_gaps="$(grep -c '^0$' "${TMP}/poll6.out")"
+[ "$_samples" -ge 100 ] && [ "$_gaps" -eq 0 ] &&
+    ok "3 renews in ipv6=disable, ${_samples} reads of disable_ipv6: never back on" ||
+    bad "IPv6 was on in ${_gaps} of ${_samples} reads during a renew"
+ns ip6tables -t mangle -S PISING_INPUT 2>/dev/null | grep -q -- '--dport 1536 -m mark ! --mark 0x200000/0x200000 -j DROP' &&
+    ok "ipv6=disable still guards the tproxy port (::1 stays up)" ||
+    bad "no IPv6 guard on the tproxy port in ipv6=disable"
+U6=$(grep -c 'connection to \[::1\]:1536' "$CORE_LOG" 2>/dev/null)
+eq "$(ns python3 "${TMP}/probe.py" tcp ::1)" "timeout" "[::1]:<tproxy port> gets no answer"
+sleep 1
+eq "$(grep -c 'connection to \[::1\]:1536' "$CORE_LOG" 2>/dev/null)" "$U6" "and never reaches the core"
 ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" off >/dev/null 2>&1
 [ "$(ns cat /proc/sys/net/ipv6/conf/vns0/disable_ipv6 2>/dev/null)" = "0" ] &&
     ok "\`off\` restored the previous sysctl values" || bad "disable_ipv6 was not restored"
@@ -257,6 +365,38 @@ ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" off >/dev/null 2>&1
     ok "\`off\` restored the new-interface template" || bad "conf/default/disable_ipv6 was not restored"
 sed -i 's/^ipv6=.*/ipv6="block"/' "$DATA/settings.ini"
 ns env PISING_DIR="$DATA" "$DATA/bin/pi.iptables" renew >/dev/null 2>&1
+
+echo "== the tproxy port answers TPROXY'd traffic only"
+# The inbound listens on every address, and a connection made to the port has
+# the port itself as its destination: the core dials it, which is itself, and
+# every dial is the next inbound connection. Measured 2026-11-21 with sing-box
+# 1.14.4: one TCP connection from a LAN neighbour, held for 1 s, was ~30 s of
+# looping (110 878 fds, 37.5 CPU-seconds), one UDP datagram 19 307 inbound
+# packet connections in 5 s. PISING_INPUT, first in mangle INPUT, drops what
+# gets to the port without the TPROXY mark (mangle has no REJECT, and behind
+# netd's mangle INPUT chains the mark is no longer ours). The host end of the
+# veth is this namespace's LAN neighbour.
+ns iptables -t mangle -S PISING_INPUT 2>/dev/null | grep -q -- '-p tcp .*--dport 1536 -m mark ! --mark 0x200000/0x200000 -j DROP' &&
+    ok "mangle INPUT drops unmarked tcp to the tproxy port" || bad "no tcp guard on the tproxy port"
+ns iptables -t mangle -S PISING_INPUT 2>/dev/null | grep -q -- '-p udp .*--dport 1536 -m mark ! --mark 0x200000/0x200000 -j DROP' &&
+    ok "and unmarked udp" || bad "no udp guard on the tproxy port"
+[ "$(ns iptables -t mangle -S INPUT 2>/dev/null | sed -n 2p)" = "-A INPUT -j PISING_INPUT" ] &&
+    ok "the guard is the first rule of mangle INPUT" || bad "the guard is not first in mangle INPUT"
+ns ip6tables -t mangle -S PISING_INPUT 2>/dev/null | grep -q -- '--dport 1536 -m mark ! --mark 0x200000/0x200000 -j DROP' &&
+    ok "the IPv6 side has the same guard" || bad "no IPv6 guard on the tproxy port"
+G1=$(grep -c 'connection to 10.99.0.2:1536' "$CORE_LOG" 2>/dev/null)
+eq "$(python3 "${TMP}/probe.py" tcp 10.99.0.2)" "timeout" "a LAN neighbour's tcp to <phone>:<tproxy port> gets no answer"
+python3 "${TMP}/probe.py" udp 10.99.0.2 >/dev/null 2>&1
+eq "$(ns python3 "${TMP}/probe.py" tcp 10.99.0.2)" "timeout" "an app on the phone gets none through the phone's own address"
+sleep 1
+eq "$(grep -c 'connection to 10.99.0.2:1536' "$CORE_LOG" 2>/dev/null)" "$G1" "neither of them, nor the neighbour's udp datagram, reached the core"
+# A proxied connection to <somewhere>:<tproxy port> is not a connection to the
+# listener: TPROXY marked it, and it has to pass.
+eq "$(ns python3 "${TMP}/probe.py" tcp 1.1.1.1)" "connected" "a proxied connection to <host>:<tproxy port> is still accepted"
+sleep 1
+grep -q 'inbound connection to 1.1.1.1:1536' "$CORE_LOG" &&
+    ok "and reaches the core with its real destination" ||
+    bad "the guard also rejected a proxied connection to port 1536"
 
 echo "== counters"
 ns iptables -t mangle -L PISING_LOCAL -n -v 2>/dev/null | head -n 10 | sed 's/^/  /'

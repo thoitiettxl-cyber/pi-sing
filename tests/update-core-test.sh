@@ -116,7 +116,15 @@ core_version() { "$DATA/bin/sing-box" version 2>/dev/null | awk '{ print $NF }';
 core_running() { PISING_DIR="$DATA" sh "$DATA/bin/pi-sing" status 2>/dev/null | grep -q '^process    : running'; }
 
 # Publish a fake release: tarball under v<tag>/, release json at /<name>.json.
-publish() {  # $1 = tag (9.9.9), $2 = release json name, $3 = core kind, $4 = digest override
+# The asset objects have GitHub's shape: a nested `uploader` object between
+# `name` and `digest` (measured 2026-11-21 on v1.14.4, key order url, id,
+# node_id, name, label, uploader, content_type, state, size, digest, ...). A
+# flat fixture kept the name and the digest on one line of the CLI's split and
+# hid that the real payload never matched: update-core verified no sha256 at
+# all. The first asset is a neighbour with another digest, which must never be
+# taken for this one's.
+publish() {  # $1 = tag (9.9.9), $2 = release json name, $3 = core kind, $4 = digest override,
+             # $5 = no-digest, $6 = flat (no nested object)
     _ver="$1"; _name="$2"; _kind="$3"; _dig="${4:-}"
     _stage="${TMP}/stage"
     rm -rf "$_stage"
@@ -134,12 +142,25 @@ publish() {  # $1 = tag (9.9.9), $2 = release json name, $3 = core kind, $4 = di
     else
         _digest_line="\"digest\": \"sha256:${_dig}\","
     fi
+    if [ "${6:-}" = "flat" ]; then
+        _nested=""
+    else
+        _nested='"label": "", "uploader": { "login": "github-actions[bot]", "id": 41898282, "type": "Bot", "site_admin": false },'
+    fi
     cat > "${DOC}/${_name}.json" <<EOF
 {
   "tag_name": "v${_ver}",
   "assets": [
     {
+      "name": "sing-box-${_ver}-android-arm.tar.gz",
+      ${_nested}
+      "state": "uploaded",
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "browser_download_url": "http://127.0.0.1/v${_ver}/sing-box-${_ver}-android-arm.tar.gz"
+    },
+    {
       "name": "sing-box-${_ver}-android-arm64.tar.gz",
+      ${_nested}
       "state": "uploaded",
       ${_digest_line}
       "browser_download_url": "http://127.0.0.1/v${_ver}/sing-box-${_ver}-android-arm64.tar.gz"
@@ -205,6 +226,15 @@ publish 9.9.10 rel-badsum ok 000000000000000000000000000000000000000000000000000
 cli rel-badsum.json update-core >"${TMP}/out3" 2>&1
 [ "$?" -ne 0 ] && ok "update-core fails on a bad digest" || bad "update-core accepted a bad digest"
 has "$LOG" "update: sha256 mismatch for sing-box-9.9.10-android-arm64.tar.gz" "mismatch is reported"
+eq "$(core_version)" "9.9.9" "previous binary kept"
+
+echo "== an asset object without a nested object is matched by its name"
+# Not GitHub's shape today, but JSON promises no key order: with the name and
+# the digest on the same line of the split the digest still has to be found.
+publish 9.9.17 rel-flat ok 0000000000000000000000000000000000000000000000000000000000000000 "" flat
+cli rel-flat.json update-core >"${TMP}/out3b" 2>&1
+[ "$?" -ne 0 ] && ok "a bad digest is refused in the flat shape too" || bad "the flat shape skipped the digest"
+has "$LOG" "update: sha256 mismatch for sing-box-9.9.17-android-arm64.tar.gz" "the flat mismatch is reported"
 eq "$(core_version)" "9.9.9" "previous binary kept"
 
 echo "== the new core rejects the config"

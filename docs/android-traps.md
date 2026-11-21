@@ -18,10 +18,17 @@ when you edit them.
   reading `/proc/<pid>/cmdline` instead; never `pkill` from a split pattern.
 - **The watchdog loop survives SIGTERM** (measured: `kill -15` returned 0 and the
   `sh` stayed in its `sleep`, its `sleep` child died). Escalate to SIGKILL.
-- **`pidof sing-box` matches every sing-box process**, so `find_pid` cannot tell
-  two cores apart; `do_stop` trusts `run/pi-sing.pid` first for that reason. A
-  second core (or a test harness) must use its own `bin_name`, otherwise a stop
-  can kill the live one (measured while testing `update-core`).
+- **`pidof sing-box` matches every sing-box process, and `run/pi-sing.pid`
+  outlives a reboot**, so neither is the core by itself: a pid from either
+  source has to pass `is_core_pid` (its executable, or the script it was launched
+  as, is this `bin_path`). Measured 2026-11-19 10:45:35 in `module.log`: the
+  first start after a boot logged `already running (pid 8143)` for a pid written
+  before that boot — no core and no rule for 85 s — and the `stop` that followed
+  logged `sing-box stopped (pid 8143)`, a SIGTERM to a process that was not ours.
+  Without that check a second core (or a test harness) with the same `bin_name`
+  could be killed by a `stop` (measured while testing `update-core`); measured
+  2026-11-21 with the live core as pid 26063, an instance in another data dir
+  with the same `bin_name` reads `process : stopped`.
 - KernelSU 3.3.1 stages a module update in `/data/adb/modules_update` and applies
   `service.sh`/`action.sh` only on the next boot. Between an in-app upgrade and a
   reboot the previous boot script still runs; it calls `$DATA/bin/pi-sing`, which
@@ -64,6 +71,13 @@ when you edit them.
   and `stop` SIGKILLed it (the agent's own shell, exit 137). Never `pkill -f` a
   path from a bridge command either: the pattern matches the command you are
   running.
+- **netd owns the packet mark by the time the filter table runs.** mangle `INPUT`
+  on this ROM ends in `routectrl_mangle_INPUT`, one `-i <iface> -j MARK
+  --set-xmark <netid>/0x7fefffff` per interface netd manages (read 2026-11-21:
+  `wlan0` → `0x300cd`), and that mask covers the module's fwmark bit. A rule
+  that has to see the TPROXY mark must sit in mangle and ahead of that chain:
+  `PISING_INPUT` is the first rule of mangle `INPUT` for that reason
+  (`docs/rules.md`, "Nothing but TPROXY reaches the tproxy port").
 - **A DNS server's own transport ignores `route.final`.** In 1.12+ a DNS server
   dials "just like an outbound", which the docs call *equivalent to an empty
   direct outbound*: without `detour` the DoH/DoT query leaves the phone directly
@@ -115,9 +129,19 @@ when you edit them.
     user's, by design.
 - **The release JSON is one line of compact JSON** (285 079 bytes measured) and
   toybox `sed`/`awk` give up on a line that long, so a layout-based parse finds
-  nothing. `update-core` now joins the payload into one line and splits it at
-  every `{` first, and a missing `digest` warns instead of refusing (sing-box's
-  tarballs have no digest; only its APK assets do).
+  nothing. `update-core` joins the payload into one line and splits it at every
+  `{` first. **That split cuts an asset object in two**: GitHub nests an
+  `uploader` object between `name` and `digest`, so the quoted name is on one
+  line and the digest on the next, next to `browser_download_url`. Looking for
+  the digest on the name's line found nothing, ever: until 2026-11-21 every
+  update logged "publishes no sha256 digest" and no sha256 was verified (against
+  the live payload a tarball with another sha256 installed with rc 0). The note
+  that used to stand here, "sing-box's tarballs have no digest", was that bug —
+  v1.14.4 has 168 assets and 168 digests. The digest is now taken from the line
+  that carries the name or the download URL (script == API for android-arm,
+  -arm64, -amd64 and -386), and an asset that really has none still installs,
+  with the warning. The test fixture has GitHub's shape now; the flat one it had
+  is what hid this.
 - **`sing-box check` does not open `log.output`, `run` does.** Measured with a
   box_for_magisk config (2026-11-04): `check` exits 0, then `run` dies with
   `start logger: open /data/adb/box/run/sing-box.log: no such file or directory`
@@ -192,6 +216,17 @@ when you edit them.
   `watchdog is not running, starting it`, the new loop writes `run/watchdog.pid`,
   a second `start` keeps exactly one loop, and its probe fixed a forced
   `disable_ipv6=0` in 0.4 s.
+- **One watchdog loop, whoever starts it.** `service.sh` runs `start` (whose
+  `ensure_watchdog` spawns a loop) and then `watchdog`, so every boot ended with
+  two. Measured on the device 2026-11-21: pids 3651 and 10920 both
+  `pi-sing watchdog` since the boot of 11-19, 70 of 95 renews logged twice in the
+  same second, three rule builds that ran into each other (`iface ap+ not
+  available yet` is what a chain flushed under a builder looks like), and a
+  mangle table with every rule twice (`PISING_EXT` 74 rules, 23 distinct).
+  `do_watchdog` leaves when `run/watchdog.pid` names another live loop — at
+  entry, or at its first wake-up when two started in the same instant and both
+  found no loop. Checked through the real `service.sh` in `tests/cli-test.sh`,
+  and on the device under mksh.
 - **An old `settings.ini` has no `core_log_level`**: resolve the default in a
   variable (`_lvl="${core_log_level:-warn}"`) before using it under `set -u`, or
   awk never runs and the config keeps `info` (measured on the first device
