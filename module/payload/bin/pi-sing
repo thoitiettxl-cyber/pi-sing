@@ -869,21 +869,32 @@ do_update_core() {
 # that only once per interval left a window as long as the interval: measured
 # 2026-11-05 on wifi -> 4G, a leak test inside that window answered from the
 # carrier's resolvers (Viettel 171.225.222.19/.20) while the card stayed 🟢, and
-# the next tick closed it. This probe is one `ip route get` (measured 4.5 ms)
-# plus one /proc read, so the loop can afford it every 2 s; the full
-# `v6enforce` (measured 35 ms) keeps its own cadence and also fixes interfaces
-# that are not the uplink.
+# the next tick closed it, so the loop checks every 2 s slice.
+# The check reads every interface's `disable_ipv6` with the shell's own `read`
+# (no fork) and starts `pi.iptables v6enforce` only when one is 0 — the same
+# condition v6enforce acts on. Measured on the device 2026-11-22 (34
+# interfaces): the 34 reads cost 1 ms, while the old probe (`ip route get |
+# awk` for the uplink alone) cost 11 ms per slice and a full v6enforce ran on
+# every tick on top; the loop and its children used 1.12 s of CPU a minute.
+# No `v6.stack.saved` means `ipv6=disable` was never applied (rules off), so
+# there is nothing to enforce. PISING_V6_CONF exists for tests/cli-test.sh.
+v6_conf="${PISING_V6_CONF:-/proc/sys/net/ipv6/conf}"
 v6_drift() {
     case "${ipv6:-off}" in disable|-1|none) ;; *) return 1 ;; esac
-    _d_if="$(ip route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
-    [ -n "${_d_if:-}" ] || return 1
-    _d="/proc/sys/net/ipv6/conf/${_d_if}"
-    [ -f "${_d}/disable_ipv6" ] || return 1
+    [ -f "${run_dir}/v6.stack.saved" ] || return 1
     # A /proc/sys value has no trailing newline, so `read` returns 1 while still
     # setting the variable (measured on the device): never chain it with `||`.
-    read -r _d_v6 < "${_d}/disable_ipv6" 2>/dev/null
-    [ "${_d_v6:-1}" = "1" ] && return 1
-    return 0
+    _d_v6=""
+    read -r _d_v6 < "${v6_conf}/default/disable_ipv6" 2>/dev/null
+    [ "${_d_v6:-1}" = "1" ] || return 0
+    for _d in "${v6_conf}"/*; do
+        case "${_d##*/}" in all|default|lo) continue ;; esac
+        [ -f "${_d}/disable_ipv6" ] || continue
+        _d_v6=""
+        read -r _d_v6 < "${_d}/disable_ipv6" 2>/dev/null
+        [ "${_d_v6:-1}" = "1" ] || return 0
+    done
+    return 1
 }
 
 do_watchdog() {
@@ -921,6 +932,7 @@ do_watchdog() {
         *) [ "$watchdog_interval" -lt "$_v6_int" ] && _v6_int="$watchdog_interval" ;;
     esac
     _waited=0
+    _v6_hold=0
     while :; do
         sleep "$_v6_int"
         # Two loops started in the same instant both get past the check at the
@@ -938,7 +950,16 @@ do_watchdog() {
         fi
         _waited=$((_waited + _v6_int))
         if [ ! -f "$state_file" ] && v6_drift; then
-            PISING_QUIET=1 "${bin_dir}/pi.iptables" v6enforce >/dev/null 2>&1
+            # A value that does not stay written would start pi.iptables (and
+            # log a line) on every slice: after a fix that did not hold, retry
+            # only on the tick.
+            if [ "$_v6_hold" = "0" ] || [ "$_waited" -ge "$watchdog_interval" ]; then
+                PISING_QUIET=1 "${bin_dir}/pi.iptables" v6enforce >/dev/null 2>&1
+                _v6_hold=0
+                v6_drift && _v6_hold=1
+            fi
+        else
+            _v6_hold=0
         fi
         [ "$_waited" -ge "$watchdog_interval" ] || continue
         _waited=0
@@ -949,10 +970,8 @@ do_watchdog() {
                 exec "$(self_sh)" "$0" watchdog
             fi
         fi
-        # Cheap: a few file reads, and a log line only when something drifted.
-        # netd re-enables IPv6 on every network it brings up, so `ipv6=disable`
-        # has to be re-applied while the rules are installed.
-        PISING_QUIET=1 "${bin_dir}/pi.iptables" v6enforce >/dev/null 2>&1
+        # netd re-enables IPv6 on every network it brings up; the slice above
+        # re-applies `ipv6=disable`, so the tick no longer runs v6enforce.
         _tick=$(( ${_tick:-0} + 1 ))
         if [ -f "$state_file" ]; then
             # A user stop (action button / `pi-sing stop`): stay down. A crash

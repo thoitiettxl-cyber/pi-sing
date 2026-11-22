@@ -38,13 +38,14 @@ tests/netns-tproxy-test.sh            55/55 — TCP, UDP/53 hijack, per-app blac
                                       core-gid bypass (no capture loop), a renew that never
                                       leaves the table without its hooks, the tproxy port
                                       answering TPROXY'd traffic only, clean teardown
-tests/cli-test.sh                     56/56 — services[].dashboard is left untouched,
+tests/cli-test.sh                     61/61 — services[].dashboard is left untouched,
                                       core_log_level, 🟢/🔴 description, log split, log rotation,
                                       watchdog leaves a user-stopped core stopped, a process
                                       that only mentions the core path is not the core, nor is
                                       a stale pid file or another sing-box, one watchdog loop
-                                      through the real service.sh, an API without a secret
-                                      reported
+                                      through the real service.sh, IPv6 drift checked without
+                                      a fork and v6enforce run only on drift, an API without a
+                                      secret reported
 tests/action-test.sh                  32/32 — fail-closed state (rules stay, core dies), the
                                       action button's one-press OFF, the 🟠 card, the watchdog
                                       not repainting 🟢, a stale verdict not carried into the

@@ -74,6 +74,14 @@ cat > "$DATA/bin/pi.iptables" <<EOF
 case "\$1" in
     on|renew) : > "${TMP}/rules.on" ;;
     off)      rm -f "${TMP}/rules.on" ;;
+    # Counts the calls and switches IPv6 off in the fake sysctl tree, except
+    # stuck0: a value that does not stay written.
+    v6enforce)
+        echo x >> "${TMP}/v6enforce.calls"
+        for _f in "\${PISING_V6_CONF:-/nonexistent}"/*/disable_ipv6; do
+            case "\$_f" in */lo/*|*/all/*|*/stuck0/*) continue ;; esac
+            [ -f "\$_f" ] && printf 1 > "\$_f"
+        done ;;
 esac
 exit 0
 EOF
@@ -299,6 +307,51 @@ wd_kill
 rm -f "${TMP}/fakebin/getprop" "${TMP}/fakebin/ip"
 sed -i 's/^watchdog=.*/watchdog=0/' "$DATA/settings.ini"
 sed -i 's/^watchdog_interval=.*/watchdog_interval=30/' "$DATA/settings.ini"
+
+echo "== the watchdog reads the IPv6 sysctls itself, v6enforce runs only on drift"
+# Measured on the device 2026-11-22: the loop cost 1.12 s of CPU a minute with
+# its children (75 ms by itself): `ip route get | awk` every 2 s slice (11 ms)
+# and a full `pi.iptables v6enforce` on every tick. Reading the 34
+# disable_ipv6 files with the shell's own `read` cost 1 ms, so the loop does
+# that every slice and starts pi.iptables only when a value is 0.
+V6="${TMP}/v6conf"
+for _i in all default lo wlan0 rmnet_data0; do
+    mkdir -p "$V6/$_i"; printf 1 > "$V6/$_i/disable_ipv6"
+done
+printf 0 > "$V6/lo/disable_ipv6"    # lo keeps ::1 and never counts as drift
+printf 0 > "$V6/all/disable_ipv6"   # `all` is never written either
+printf 0 > "$V6/rmnet_data0/disable_ipv6"
+v6calls() { if [ -f "${TMP}/v6enforce.calls" ]; then wc -l < "${TMP}/v6enforce.calls" | tr -d ' '; else echo 0; fi; }
+reset
+rm -f "${TMP}/v6enforce.calls" "$DATA/run/v6.stack.saved"
+sed -i -e 's/^watchdog=.*/watchdog=1/' -e 's/^watchdog_interval=.*/watchdog_interval=4/' \
+    -e 's/^ipv6=.*/ipv6="disable"/' "$DATA/settings.ini"
+export PISING_V6_CONF="$V6"
+cli start >/dev/null 2>&1
+sleep 5
+eq "$(v6calls)" "0" "no v6.stack.saved (ipv6=disable not applied): no v6enforce, even on drift"
+: > "$DATA/run/v6.stack.saved"
+printf 1 > "$V6/rmnet_data0/disable_ipv6"
+rm -f "${TMP}/v6enforce.calls"
+sleep 9
+eq "$(v6calls)" "0" "every interface off: two ticks, no v6enforce"
+printf 0 > "$V6/rmnet_data0/disable_ipv6"
+sleep 3
+eq "$(cat "$V6/rmnet_data0/disable_ipv6")" "1" "an interface that is not the uplink is fixed within one 2 s slice"
+eq "$(v6calls)" "1" "by one v6enforce"
+mkdir -p "$V6/stuck0"; printf 0 > "$V6/stuck0/disable_ipv6"
+rm -f "${TMP}/v6enforce.calls"
+sleep 12
+_n="$(v6calls)"
+[ "$_n" -ge 2 ] && [ "$_n" -le 4 ] &&
+    ok "a value that does not stay written is retried per tick, not per slice (${_n} calls in 12 s)" ||
+    bad "a stuck value was retried ${_n} times in 12 s (want 2-4: once, then per 4 s tick)"
+cli stop >/dev/null 2>&1
+wd_kill
+unset PISING_V6_CONF
+rm -rf "$V6" "${TMP}/v6enforce.calls" "$DATA/run/v6.stack.saved"
+sed -i -e 's/^watchdog=.*/watchdog=0/' -e 's/^watchdog_interval=.*/watchdog_interval=30/' \
+    -e 's/^ipv6=.*/ipv6="block"/' "$DATA/settings.ini"
 
 echo "== a process that only mentions the core path is not the core"
 echo "== a name lookup that fails while 1.1.1.1 works turns the card orange"

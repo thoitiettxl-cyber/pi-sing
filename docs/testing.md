@@ -10,7 +10,7 @@ SINGBOX_BIN=/root/tmp/sbref/sing-box-1.14.4-linux-arm64/sing-box tests/smoke-che
 SINGBOX_BIN=... tests/netns-tproxy-test.sh          # 55/55 expected
 tests/update-core-test.sh                           # 47/47 expected, no device
 tests/installer-test.sh                             # 67/67 expected, no device
-tests/cli-test.sh                                   # 56/56 expected, no device
+tests/cli-test.sh                                   # 61/61 expected, no device
 tests/action-test.sh                                # 32/32 expected, no device
 tools/build.sh                                      # smoke + the module zip (no core)
 ```

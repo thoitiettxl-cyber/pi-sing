@@ -170,11 +170,23 @@ when you edit them.
   4G and running a leak test inside those 30 s answered from the carrier's
   resolvers (`Viettel 171.225.222.19/.20`) while the card stayed 🟢, and only the
   next tick closed it — so a fast switch always leaked. The loop now wakes on a
-  2 s slice and calls `v6_drift` first (one `ip route get`, measured 4.5 ms, and
-  one `/proc` read of the uplink's `disable_ipv6`); a drifted uplink is fixed in
-  ≤2 s (measured 0.1 s / 1.1 s / 1.6 s over three runs), an idle loop costs 70 ms
-  of CPU per minute (measured over 60 s), and an interface that is not the uplink
-  still waits for the tick (measured: `ds-br0` fixed in 7 s).
+  2 s slice and calls `v6_drift` first; a drifted uplink is fixed in ≤2 s
+  (measured 0.1 s / 1.1 s / 1.6 s over three runs).
+  **Count the children when you measure the loop.** The first `v6_drift` was
+  `ip route get | awk` for the uplink alone, and the tick ran a full
+  `pi.iptables v6enforce` on top. Its "70 ms of CPU per minute" was the shell's
+  own time; measured 2026-11-22 with `cutime`+`cstime` of the loop's pid it was
+  1.12 s per minute (75 ms by itself, the rest forks: `ip route get`+`awk`
+  11 ms, `sleep` 8.7 ms, per call). `v6_drift` now reads every interface's
+  `disable_ipv6` with the shell's own `read` (34 files: 1 ms, no fork) and
+  starts `v6enforce` only when one is 0 — the same condition v6enforce acts on —
+  so the tick no longer runs it. Measured on the device after the change: 0.66 /
+  0.72 / 0.76 s per minute over three 60 s windows with no drift (what is left is
+  mostly `sleep`, `cksum`, `running_pid` and the tick's `ip route get`), and an
+  interface that is not the uplink is fixed in 0.9 / 1.2 / 1.1 s instead of at
+  the next tick (`dummy0` set to 0 by hand; before: `ds-br0` in 7 s). A value
+  that does not stay written is retried on the tick, not every slice, so it
+  cannot turn into a pi.iptables run and a log line every 2 s.
   `all/disable_ipv6` must still stay untouched: writing it cascades to `lo` and
   kills `::1` (measured).
 - **A resolver that dies while the tunnel still works is a leak, not a tunnel
